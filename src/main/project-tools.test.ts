@@ -31,6 +31,15 @@ describe("project-tools", () => {
     expect(() => writeTextFile(project, "../escape.txt", "bad")).toThrowError();
   });
 
+  it("blocks sibling-prefix escape paths", () => {
+    const base = createTempProject();
+    const project = path.join(base, "repo");
+    const sibling = path.join(base, "repo2");
+    fs.mkdirSync(project, { recursive: true });
+    fs.mkdirSync(sibling, { recursive: true });
+    expect(() => writeTextFile(project, "../repo2/escape.txt", "bad")).toThrowError();
+  });
+
   it("lists files and directories", () => {
     const project = createTempProject();
     writeTextFile(project, "file1.txt", "a");

@@ -42,7 +42,7 @@ const defaultState: AppState = {
   messages: [],
   providers: defaultProviders,
   settings: DEFAULT_SETTINGS,
-  projectSkills: []
+  projectSkills: [],
 };
 
 const dataPath = () => path.join(app.getPath("userData"), "sncode-state.json");
@@ -63,8 +63,20 @@ export class Store {
       return this.getState();
     }
 
-    const raw = fs.readFileSync(target, "utf8");
-    const parsed = JSON.parse(raw) as Partial<AppState> & LegacyState;
+    let parsed: (Partial<AppState> & LegacyState) | null = null;
+    try {
+      const raw = fs.readFileSync(target, "utf8");
+      parsed = JSON.parse(raw) as Partial<AppState> & LegacyState;
+    } catch {
+      // Recover from corrupted state by resetting to defaults.
+      this.state = structuredClone(defaultState);
+      this.persist();
+      return this.getState();
+    }
+    if (!parsed) {
+      this.state = structuredClone(defaultState);
+      return this.getState();
+    }
     const legacyThreads = (parsed as LegacyState).threads ?? [];
     const legacyProviders = (parsed as LegacyState).providers ?? [];
 
@@ -83,6 +95,7 @@ export class Store {
         id: thread.id,
         projectId: thread.projectId,
         title: thread.title,
+        codexThreadId: (thread as Thread).codexThreadId,
         createdAt: thread.createdAt,
         updatedAt: thread.updatedAt
       })),
@@ -99,7 +112,7 @@ export class Store {
         ...DEFAULT_SETTINGS,
         ...(parsed.settings ?? {})
       },
-      projectSkills: parsed.projectSkills ?? []
+      projectSkills: parsed.projectSkills ?? [],
     };
 
     if (this.state.providers.length === 0) {
@@ -155,6 +168,7 @@ export class Store {
       id: nanoid(),
       projectId: input.projectId,
       title: input.title,
+      codexThreadId: undefined,
       createdAt: now(),
       updatedAt: now()
     };
@@ -170,10 +184,11 @@ export class Store {
     this.persist();
   }
 
-  updateThread(threadId: string, updates: Partial<Pick<Thread, "title">>): Thread | undefined {
+  updateThread(threadId: string, updates: Partial<Pick<Thread, "title" | "codexThreadId">>): Thread | undefined {
     const thread = this.state.threads.find((t) => t.id === threadId);
     if (!thread) return undefined;
     if (updates.title !== undefined) thread.title = updates.title;
+    if (updates.codexThreadId !== undefined) thread.codexThreadId = updates.codexThreadId;
     thread.updatedAt = now();
     this.persist();
     return structuredClone(thread);
@@ -239,6 +254,18 @@ export class Store {
     return this.getState().providers;
   }
 
+  updateProviders(
+    batch: Array<{ id: ProviderConfig["id"]; updates: Partial<Pick<ProviderConfig, "enabled" | "authMode" | "model">> }>
+  ) {
+    for (const entry of batch) {
+      const provider = this.state.providers.find((item) => item.id === entry.id);
+      if (!provider) throw new Error(`Provider not found: ${entry.id}`);
+      Object.assign(provider, entry.updates);
+    }
+    this.persist();
+    return this.getState().providers;
+  }
+
   /* ── Skills ── */
 
   getProjectSkills(projectId: string): ProjectSkillConfig {
@@ -268,4 +295,5 @@ export class Store {
     this.persist();
     return structuredClone(config);
   }
+
 }

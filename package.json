@@ -14,7 +14,7 @@
   "scripts": {
     "dev": "concurrently -k \"npm:dev:renderer\" \"npm:dev:electron\"",
     "dev:renderer": "vite --host 127.0.0.1 --port 5188 --strictPort",
-    "dev:electron": "concurrently -k \"npm:build:electron:watch\" \"wait-on http-get://127.0.0.1:5188 http-get://127.0.0.1:5188/@vite/client dist-electron/main/main.js && electron .\"",
+    "dev:electron": "concurrently -k \"npm:build:electron:watch\" \"wait-on http-get://127.0.0.1:5188 http-get://127.0.0.1:5188/@vite/client dist-electron/main/main.js && electronmon .\"",
     "build": "vite build && npm run build:electron",
     "build:electron": "tsc -p tsconfig.node.json",
     "build:electron:watch": "tsc -p tsconfig.node.json --watch",
@@ -24,6 +24,12 @@
     "test": "vitest run",
     "icons": "node scripts/generate-icons.mjs",
     "package": "npm run build && electron-builder"
+  },
+  "electronmon": {
+    "patterns": [
+      "dist-electron/**"
+    ],
+    "logLevel": "info"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.74.0",
@@ -50,6 +56,7 @@
     "concurrently": "^9.2.0",
     "electron": "^37.2.5",
     "electron-builder": "^26.0.12",
+    "electronmon": "^2.0.4",
     "eslint": "^9.37.0",
     "eslint-plugin-react-hooks": "^5.2.0",
     "eslint-plugin-react-refresh": "^0.4.24",

@@ -22,7 +22,8 @@ export const imageAttachmentSchema = z.object({
 export const sendMessageInputSchema = z.object({
   threadId: z.string().trim().min(1),
   content: z.string().max(12000),
-  images: z.array(imageAttachmentSchema).max(10).optional()
+  images: z.array(imageAttachmentSchema).max(10).optional(),
+  permissionMode: z.enum(["full", "approve"]).optional(),
 }).refine(
   (data) => data.content.trim().length > 0 || (data.images && data.images.length > 0),
   { message: "Message must have text or at least one image" }
@@ -34,6 +35,8 @@ export const providerUpdateInputSchema = z.object({
   authMode: authModeSchema.optional(),
   model: z.string().trim().min(1).max(120).optional()
 });
+
+export const providerUpdateBatchInputSchema = z.array(providerUpdateInputSchema).min(1).max(10);
 
 export const providerCredentialInputSchema = z.object({
   id: providerIdSchema,

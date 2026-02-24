@@ -44,12 +44,35 @@ export function getEnvironmentInfo(): EnvironmentInfo {
   };
 }
 
-function resolveInsideProject(projectRoot: string, targetPath: string) {
+function isInsidePath(rootPath: string, candidatePath: string) {
+  const rel = path.relative(rootPath, candidatePath);
+  return rel === "" || (!rel.startsWith("..") && !path.isAbsolute(rel));
+}
+
+function safeRealpath(target: string) {
+  try {
+    return fs.realpathSync.native(target);
+  } catch {
+    return fs.realpathSync(target);
+  }
+}
+
+function resolveInsideProject(projectRoot: string, targetPath: string, mode: "read" | "write" = "read") {
+  const normalizedRoot = safeRealpath(path.resolve(projectRoot));
   const resolved = path.resolve(projectRoot, targetPath || ".");
-  const normalizedRoot = path.resolve(projectRoot);
-  if (!resolved.startsWith(normalizedRoot)) {
+
+  if (!isInsidePath(normalizedRoot, resolved)) {
     throw new Error("Path escapes project root");
   }
+
+  const existingPath = mode === "write" ? path.dirname(resolved) : resolved;
+  if (fs.existsSync(existingPath)) {
+    const canonical = safeRealpath(existingPath);
+    if (!isInsidePath(normalizedRoot, canonical)) {
+      throw new Error("Path escapes project root");
+    }
+  }
+
   return resolved;
 }
 
@@ -77,7 +100,7 @@ export function readTextFile(projectRoot: string, relativePath: string) {
 }
 
 export function writeTextFile(projectRoot: string, relativePath: string, content: string) {
-  const resolved = resolveInsideProject(projectRoot, relativePath);
+  const resolved = resolveInsideProject(projectRoot, relativePath, "write");
   fs.mkdirSync(path.dirname(resolved), { recursive: true });
   fs.writeFileSync(resolved, content, "utf8");
   return { ok: true };

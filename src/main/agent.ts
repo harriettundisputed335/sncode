@@ -1,7 +1,10 @@
 import Anthropic from "@anthropic-ai/sdk";
 import OpenAI from "openai";
+import * as fs from "fs";
+import * as path from "path";
+import * as os from "os";
 import { AgentSettings, ProviderConfig, SubAgentType, ThreadMessage } from "../shared/types";
-import { isOAuthCredential, parseOAuthCredential, refreshAnthropicToken, refreshCodexToken } from "./oauth";
+import { isOAuthCredential, parseOAuthCredential, OAuthData, refreshAnthropicToken, refreshCodexToken } from "./oauth";
 import { EnvironmentInfo, listFiles, readTextFile, runCommand, writeTextFile, editFile, globFiles, grepFiles, RunCommandOptions, getEnvironmentInfo } from "./project-tools";
 import { loadSkillContent } from "./skills";
 import { McpTool } from "./mcp";
@@ -44,6 +47,109 @@ export interface RunAgentInput {
 const DEFAULT_MAX_TOKENS = 16384;
 const DEFAULT_MAX_TOOL_STEPS = 25;
 
+/* ── Project memory ── */
+
+const MEMORY_DIR = ".sncode";
+const MEMORY_FILE = "memory.md";
+
+function readProjectMemory(projectRoot: string): string {
+  try {
+    const memPath = path.join(projectRoot, MEMORY_DIR, MEMORY_FILE);
+    return fs.readFileSync(memPath, "utf-8");
+  } catch {
+    return "";
+  }
+}
+
+function writeProjectMemory(projectRoot: string, content: string): string {
+  try {
+    const dir = path.join(projectRoot, MEMORY_DIR);
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, MEMORY_FILE), content, "utf-8");
+    return "Memory updated successfully.";
+  } catch (err) {
+    return `Error writing memory: ${err instanceof Error ? err.message : String(err)}`;
+  }
+}
+
+/* ── Token estimation ── */
+
+/** Rough token estimate: ~4 chars per token for English text */
+function estimateTokens(text: string): number {
+  return Math.ceil(text.length / 4);
+}
+
+function estimateMessageTokens(msg: ThreadMessage): number {
+  let tokens = estimateTokens(msg.content);
+  if (msg.images) {
+    // Each image is roughly 1000-2000 tokens depending on size
+    tokens += msg.images.length * 1500;
+  }
+  return tokens;
+}
+
+/* ── Context compaction ── */
+
+/**
+ * Compact conversation history when it exceeds the token budget.
+ * Strategy:
+ * 1. Keep the first user message (provides original context)
+ * 2. Summarize middle messages into a compact recap
+ * 3. Keep the last N messages verbatim for recent context
+ *
+ * Returns the original history if within budget.
+ */
+function compactHistory(
+  history: ThreadMessage[],
+  contextBudget: number
+): ThreadMessage[] {
+  // Only consider user + assistant messages for compaction
+  const chatMessages = history.filter((m) => m.role === "user" || m.role === "assistant");
+  if (chatMessages.length <= 4) return history; // too short to compact
+
+  let totalEstimate = 0;
+  for (const m of chatMessages) totalEstimate += estimateMessageTokens(m);
+  if (totalEstimate < contextBudget) return history; // within budget
+
+  // Keep first 2 messages + last 6 messages, summarize the rest
+  const KEEP_FIRST = 2;
+  const KEEP_LAST = 6;
+  if (chatMessages.length <= KEEP_FIRST + KEEP_LAST) return history;
+
+  const firstMsgs = chatMessages.slice(0, KEEP_FIRST);
+  const middleMsgs = chatMessages.slice(KEEP_FIRST, chatMessages.length - KEEP_LAST);
+  const lastMsgs = chatMessages.slice(chatMessages.length - KEEP_LAST);
+
+  // Build a compact summary of middle messages
+  const summaryParts: string[] = [];
+  for (const m of middleMsgs) {
+    const role = m.role === "user" ? "User" : "Assistant";
+    const snippet = m.content.length > 200 ? m.content.slice(0, 200) + "..." : m.content;
+    summaryParts.push(`[${role}]: ${snippet}`);
+  }
+
+  const summaryMsg: ThreadMessage = {
+    id: "compacted-summary",
+    threadId: chatMessages[0].threadId,
+    role: "assistant",
+    content: `[Context compacted — ${middleMsgs.length} earlier messages summarized]\n\n${summaryParts.join("\n\n")}`,
+    createdAt: new Date().toISOString(),
+  };
+
+  return [...firstMsgs, summaryMsg, ...lastMsgs];
+}
+
+/* ── Timeout helper ── */
+
+const SUB_AGENT_TIMEOUT_MS = 180_000; // 3 minutes per sub-agent API call
+
+function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(`${label} timed out after ${Math.round(ms / 1000)}s`)), ms);
+    promise.then((v) => { clearTimeout(timer); resolve(v); }).catch((e) => { clearTimeout(timer); reject(e); });
+  });
+}
+
 /* ── System prompt ── */
 
 function platformLabel(platform: string): string {
@@ -56,7 +162,8 @@ function buildSystemPrompt(
   env: EnvironmentInfo,
   projectRoot: string,
   enabledSkills?: Array<{ name: string; content: string }>,
-  availableSkills?: SkillSummary[]
+  availableSkills?: SkillSummary[],
+  projectMemory?: string
 ): string {
   const today = new Date().toLocaleDateString("en-US", { weekday: "short", year: "numeric", month: "short", day: "numeric" });
   const platformName = platformLabel(env.platform);
@@ -120,6 +227,19 @@ You have access to tools to inspect and edit code in the user's project. Use too
 - After making changes, consider running relevant checks (typecheck, lint, build, tests) to verify correctness.
 - If a build or test fails after your change, analyze the error and fix it.
 - Only create new files when the task genuinely requires it.`;
+
+  // Append project memory if present
+  if (projectMemory && projectMemory.trim()) {
+    prompt += `\n\n# Project Memory
+The following is persistent memory for this project. It carries over across all threads and sessions. Use the \`memory_read\` and \`memory_write\` tools to read and update it. Save important context here: project conventions, architecture decisions, key file locations, user preferences, resolved issues, etc.
+
+<project_memory>
+${projectMemory.trim()}
+</project_memory>`;
+  } else {
+    prompt += `\n\n# Project Memory
+This project has no saved memory yet. Use the \`memory_write\` tool to save important context that should persist across threads: project conventions, architecture decisions, key file locations, user preferences, etc.`;
+  }
 
   // Append available skills section
   if (availableSkills && availableSkills.length > 0) {
@@ -230,6 +350,26 @@ function buildAnthropicTools(env: EnvironmentInfo, availableSkills?: SkillSummar
       },
     },
   ];
+
+  // Memory tools
+  tools.push(
+    {
+      name: "memory_read",
+      description: "Read the project's persistent memory file (.sncode/memory.md). Use this to recall saved context about the project: conventions, architecture decisions, key file locations, user preferences, etc.",
+      input_schema: { type: "object" as const, properties: {}, required: [] },
+    },
+    {
+      name: "memory_write",
+      description: "Write to the project's persistent memory file (.sncode/memory.md). This REPLACES the entire memory content. Use this to save important context that should persist across threads: project conventions, architecture decisions, key file locations, resolved issues, user preferences. Always read memory first, then write the updated version.",
+      input_schema: {
+        type: "object" as const,
+        properties: {
+          content: { type: "string", description: "The full markdown content to save as project memory." },
+        },
+        required: ["content"],
+      },
+    }
+  );
 
   // Add load_skill tool if there are available skills
   if (availableSkills && availableSkills.length > 0) {
@@ -353,6 +493,32 @@ function buildOpenAITools(env: EnvironmentInfo, availableSkills?: SkillSummary[]
     },
   ];
 
+  // Memory tools
+  tools.push(
+    {
+      type: "function",
+      function: {
+        name: "memory_read",
+        description: "Read the project's persistent memory file (.sncode/memory.md). Recall saved context about the project.",
+        parameters: { type: "object", properties: {}, required: [] },
+      },
+    },
+    {
+      type: "function",
+      function: {
+        name: "memory_write",
+        description: "Write to the project's persistent memory file (.sncode/memory.md). REPLACES the entire memory content. Always read first, then write the updated version.",
+        parameters: {
+          type: "object",
+          properties: {
+            content: { type: "string", description: "Full markdown content to save as project memory." },
+          },
+          required: ["content"],
+        },
+      },
+    }
+  );
+
   // Add load_skill tool if there are available skills
   if (availableSkills && availableSkills.length > 0) {
     tools.push({
@@ -472,16 +638,20 @@ async function runSubAgentAnthropic(
   }
 
   const allTools = buildAnthropicTools(env);
-  const tools = isExplore ? allTools.filter((t) => EXPLORE_TOOLS.has(t.name)) : allTools.filter((t) => t.name !== "spawn_task" && t.name !== "load_skill");
+  const tools = isExplore ? allTools.filter((t) => EXPLORE_TOOLS.has(t.name)) : allTools.filter((t) => t.name !== "spawn_task" && t.name !== "load_skill" && t.name !== "memory_read" && t.name !== "memory_write");
   const messages: Anthropic.MessageParam[] = [{ role: "user", content: userPrompt }];
   let finalText = "";
 
   for (let step = 0; step < maxToolSteps; step++) {
     if (abortSignal?.aborted) throw new Error("Run cancelled");
 
-    const response = await client.messages.create(
-      { model, max_tokens: maxTokens, system: systemPrompt, tools, messages },
-      { signal: abortSignal }
+    const response = await withTimeout(
+      client.messages.create(
+        { model, max_tokens: maxTokens, system: systemPrompt, tools, messages },
+        { signal: abortSignal }
+      ),
+      SUB_AGENT_TIMEOUT_MS,
+      "Sub-agent Anthropic API call"
     );
 
     let stepText = "";
@@ -520,19 +690,20 @@ async function runSubAgentOpenAI(
   onProgress?: (detail: string) => void, abortSignal?: AbortSignal
 ): Promise<string> {
   const isOAuth = isOAuthCredential(credential);
-  let client: OpenAI;
+
+  // OAuth users → Codex Responses API (different endpoint + request format)
   if (isOAuth) {
-    const accessToken = await getValidOAuthToken(credential, "codex");
-    client = new OpenAI({ apiKey: accessToken, baseURL: "https://api.openai.com/v1" });
-  } else {
-    client = new OpenAI({ apiKey: credential });
+    return runCodexOAuthSubAgent(provider, credential, model, systemPrompt, userPrompt, maxTokens, maxToolSteps, env, projectRoot, isExplore, onProgress, abortSignal);
   }
+
+  // API key users → standard Chat Completions API
+  const client = new OpenAI({ apiKey: credential });
 
   const allTools = buildOpenAITools(env);
   const fnName = (t: OpenAI.Chat.Completions.ChatCompletionTool) => t.type === "function" ? t.function.name : "";
   const tools = isExplore
     ? allTools.filter((t) => EXPLORE_TOOLS.has(fnName(t)))
-    : allTools.filter((t) => { const n = fnName(t); return n !== "spawn_task" && n !== "load_skill"; });
+    : allTools.filter((t) => { const n = fnName(t); return n !== "spawn_task" && n !== "load_skill" && n !== "memory_read" && n !== "memory_write"; });
   const messages: OpenAI.Chat.Completions.ChatCompletionMessageParam[] = [
     { role: "system", content: systemPrompt },
     { role: "user", content: userPrompt },
@@ -542,9 +713,13 @@ async function runSubAgentOpenAI(
   for (let step = 0; step < maxToolSteps; step++) {
     if (abortSignal?.aborted) throw new Error("Run cancelled");
 
-    const response = await client.chat.completions.create(
-      { model, max_completion_tokens: maxTokens, messages, tools },
-      { signal: abortSignal }
+    const response = await withTimeout(
+      client.chat.completions.create(
+        { model, max_completion_tokens: maxTokens, messages, tools },
+        { signal: abortSignal }
+      ),
+      SUB_AGENT_TIMEOUT_MS,
+      "Sub-agent OpenAI API call"
     );
 
     const choice = response.choices[0];
@@ -591,7 +766,7 @@ async function executeTool(
   subAgentCtx?: SubAgentContext,
   /** For spawn_task: pending message ID to report trail entries */
   taskPendingId?: string,
-  taskProgressCb?: (pendingId: string, entry: { type: "tool" | "text"; summary: string; timestamp: string }) => void
+  taskProgressCb?: (pendingId: string, entry: { type: "tool" | "text"; summary: string; timestamp: string }) => void,
 ): Promise<string> {
   try {
     if (abortSignal?.aborted) throw new Error("Run cancelled");
@@ -644,6 +819,15 @@ async function executeTool(
       const result = await runCommand(projectRoot, commandArg, opts);
       return JSON.stringify(result, null, 2);
     }
+    if (name === "memory_read") {
+      const content = readProjectMemory(projectRoot);
+      return content || "(No project memory saved yet)";
+    }
+    if (name === "memory_write") {
+      const content = String(args.content || "");
+      if (!content) return "Error: content is required";
+      return writeProjectMemory(projectRoot, content);
+    }
     if (name === "load_skill") {
       const skillId = String(args.skill_id || "");
       if (!skillId) return "Error: skill_id is required";
@@ -676,6 +860,9 @@ async function executeTool(
 
 /* ── OAuth helpers ── */
 
+/** Codex Responses API endpoint — all OAuth requests are rewritten here */
+const CODEX_API_ENDPOINT = "https://chatgpt.com/backend-api/codex/responses";
+
 async function getValidOAuthToken(
   credential: string,
   providerId: ProviderConfig["id"]
@@ -691,6 +878,118 @@ async function getValidOAuthToken(
   }
 
   return oauth.access;
+}
+
+/** Get valid OAuth data (with refresh if expired) */
+async function getValidOAuthData(
+  credential: string,
+  providerId: ProviderConfig["id"]
+): Promise<OAuthData> {
+  const oauth = parseOAuthCredential(credential);
+  if (!oauth) throw new Error("Invalid OAuth credential");
+
+  if (oauth.expires < Date.now() + 30_000) {
+    return providerId === "anthropic"
+      ? await refreshAnthropicToken(oauth)
+      : await refreshCodexToken(oauth);
+  }
+
+  return oauth;
+}
+
+/**
+ * Build a User-Agent string for Codex requests.
+ * Format: "sncode/0.2.0 (win32 10.0.26100; x64)"
+ */
+function codexUserAgent(): string {
+  return `sncode/0.2.0 (${os.platform()} ${os.release()}; ${os.arch()})`;
+}
+
+/**
+ * Create an OpenAI client configured for Codex OAuth.
+ *
+ * Key behaviors (matching the reference opencode implementation):
+ * 1. URL rewrite: all /v1/responses and /chat/completions requests → CODEX_API_ENDPOINT
+ * 2. Authorization: Bearer <access_token> (not API key)
+ * 3. ChatGPT-Account-Id header for org subscriptions
+ * 4. originator: opencode header
+ * 5. Custom User-Agent
+ */
+function createCodexOAuthClient(oauthData: OAuthData): OpenAI {
+  return new OpenAI({
+    apiKey: "codex-oauth-placeholder", // dummy, overridden by fetch
+    baseURL: "https://api.openai.com/v1",
+    fetch: async (reqInput: string | URL | Request, init?: RequestInit) => {
+      // Build headers from init
+      const headers = new Headers(init?.headers);
+
+      // Remove any default API key authorization
+      headers.delete("authorization");
+      headers.delete("Authorization");
+
+      // Set Bearer token auth
+      headers.set("authorization", `Bearer ${oauthData.access}`);
+
+      // Set ChatGPT-Account-Id for organization subscriptions
+      if (oauthData.accountId) {
+        headers.set("ChatGPT-Account-Id", oauthData.accountId);
+      }
+
+      // Set originator and User-Agent (matching opencode reference)
+      headers.set("originator", "opencode");
+      headers.set("User-Agent", codexUserAgent());
+
+      // Rewrite URL: /v1/responses and /chat/completions → CODEX_API_ENDPOINT
+      let url: URL;
+      if (reqInput instanceof URL) {
+        url = reqInput;
+      } else if (typeof reqInput === "string") {
+        url = new URL(reqInput);
+      } else {
+        url = new URL(reqInput.url);
+      }
+
+      const finalUrl =
+        url.pathname.includes("/v1/responses") || url.pathname.includes("/chat/completions")
+          ? new URL(CODEX_API_ENDPOINT)
+          : url;
+
+      // Debug: log outgoing request details
+      const headersObj: Record<string, string> = {};
+      headers.forEach((v, k) => { headersObj[k] = k.toLowerCase() === "authorization" ? `${v.slice(0, 20)}...` : v; });
+      console.log(`[Codex fetch] ${init?.method || "GET"} ${finalUrl.toString()}`);
+      console.log(`[Codex fetch] Headers:`, JSON.stringify(headersObj, null, 2));
+      if (init?.body) {
+        try {
+          const bodyStr = typeof init.body === "string" ? init.body : new TextDecoder().decode(init.body as ArrayBuffer);
+          const bodyJson = JSON.parse(bodyStr);
+          // Log body without the full input/tools (too large), just keys and model
+          console.log(`[Codex fetch] Body keys:`, Object.keys(bodyJson));
+          console.log(`[Codex fetch] model:`, bodyJson.model);
+          if (bodyJson.tools) console.log(`[Codex fetch] tools count:`, bodyJson.tools.length, `first tool type:`, bodyJson.tools[0]?.type, `name:`, bodyJson.tools[0]?.name);
+          if (bodyJson.input) console.log(`[Codex fetch] input items:`, bodyJson.input.length);
+          if (bodyJson.messages) console.log(`[Codex fetch] messages count:`, bodyJson.messages.length, `(WRONG FORMAT — Chat Completions detected!)`);
+          if (bodyJson.stream !== undefined) console.log(`[Codex fetch] stream:`, bodyJson.stream);
+          if (bodyJson.instructions) console.log(`[Codex fetch] instructions length:`, bodyJson.instructions.length);
+        } catch { console.log(`[Codex fetch] Body: (not JSON)`); }
+      }
+
+      const response = await globalThis.fetch(finalUrl, { ...init, headers });
+
+      // Debug: log response status and body on error
+      if (!response.ok) {
+        const cloned = response.clone();
+        const errorBody = await cloned.text().catch(() => "(could not read body)");
+        console.error(`[Codex fetch] ERROR ${response.status} ${response.statusText}`);
+        console.error(`[Codex fetch] Response headers:`, Object.fromEntries(cloned.headers.entries()));
+        console.error(`[Codex fetch] Response body:`, errorBody || "(empty)");
+      } else {
+        console.log(`[Codex fetch] OK ${response.status}`);
+      }
+
+      return response;
+    },
+  });
 }
 
 /* ── Convert ThreadMessage history → Anthropic messages ── */
@@ -757,6 +1056,339 @@ function toOpenAIMessages(history: ThreadMessage[], systemPrompt: string): OpenA
   return messages;
 }
 
+/* ── Codex Responses API helpers ── */
+
+/** Convert Chat Completions tool defs to Responses API format */
+function toResponsesTools(
+  chatTools: OpenAI.Chat.Completions.ChatCompletionTool[]
+): Array<{ type: "function"; name: string; description: string; parameters: Record<string, unknown> }> {
+  return chatTools
+    .filter((t): t is OpenAI.Chat.Completions.ChatCompletionTool & { type: "function"; function: { name: string; description?: string; parameters?: unknown } } => t.type === "function" && "function" in t)
+    .map((t) => ({
+      type: "function" as const,
+      name: t.function.name,
+      description: t.function.description || "",
+      parameters: (t.function.parameters || { type: "object", properties: {} }) as Record<string, unknown>,
+    }));
+}
+
+/** Convert ThreadMessage history to Responses API input items */
+function toResponsesInput(history: ThreadMessage[]): any[] {
+  const items: any[] = [];
+  for (const msg of history) {
+    if (msg.role === "user") {
+      if (msg.images && msg.images.length > 0) {
+        const content: any[] = [];
+        for (const img of msg.images) {
+          content.push({
+            type: "input_image",
+            image_url: `data:${img.mediaType};base64,${img.data}`,
+          });
+        }
+        if (msg.content) {
+          content.push({ type: "input_text", text: msg.content });
+        }
+        items.push({ role: "user", content });
+      } else {
+        items.push({ role: "user", content: msg.content });
+      }
+    } else if (msg.role === "assistant") {
+      items.push({ role: "assistant", content: msg.content });
+    }
+  }
+  return items;
+}
+
+/** Internal type for accumulated function calls from Responses API */
+interface CodexFnCall {
+  id: string;
+  callId: string;
+  name: string;
+  arguments: string;
+}
+
+/* ── Codex OAuth streaming agentic loop (Responses API) ── */
+
+async function runCodexOAuthAgent(
+  provider: ProviderConfig,
+  credential: string,
+  input: RunAgentInput
+): Promise<AgentResult> {
+  const oauthData = await getValidOAuthData(credential, "codex");
+  const client = createCodexOAuthClient(oauthData);
+
+  const env = getEnvironmentInfo();
+  const projectMemory = readProjectMemory(input.projectRoot);
+  const systemPrompt = buildSystemPrompt(env, input.projectRoot, input.enabledSkills, input.availableSkills, projectMemory);
+  const chatTools = buildOpenAITools(env, input.availableSkills);
+  const tools = toResponsesTools(chatTools);
+
+  // Codex models have 400K context — use 300K compaction budget
+  const compactedHistory = compactHistory(input.history, 300_000);
+  const inputItems: any[] = toResponsesInput(compactedHistory);
+  const maxTokens = input.settings.maxTokens || DEFAULT_MAX_TOKENS;
+  const maxToolSteps = input.settings.maxToolSteps || DEFAULT_MAX_TOOL_STEPS;
+  let finalText = "";
+  let totalInputTokens = 0;
+  let totalOutputTokens = 0;
+
+  const subAgentCtx: SubAgentContext = {
+    providers: input.providers,
+    getCredential: input.getCredential,
+    settings: input.settings,
+  };
+
+  // Reasoning effort — Codex 5.2/5.3 support: low, medium, high, xhigh
+  // Codex 5.1 supports: low, medium, high. Default to "medium" (matching opencode reference).
+  const thinkingLevel = input.settings.thinkingLevel || "none";
+  const reasoningEffort = thinkingLevel !== "none" ? thinkingLevel : "medium";
+
+  for (let step = 0; step < maxToolSteps; step++) {
+    if (input.abortSignal?.aborted) throw new Error("Run cancelled");
+
+    let stepText = "";
+    const functionCalls: CodexFnCall[] = [];
+    const fnAccumulators = new Map<number, CodexFnCall>();
+    let stepInputTokens = 0;
+    let stepOutputTokens = 0;
+
+    const createParams: any = {
+      model: provider.model,
+      instructions: systemPrompt,
+      input: inputItems,
+      tools,
+      store: false, // Codex endpoint requires store=false
+      reasoning: { effort: reasoningEffort, summary: "auto" },
+      max_output_tokens: maxTokens,
+    };
+
+    const stream = client.responses.stream(createParams);
+
+    for await (const event of stream as any as AsyncIterable<any>) {
+      if (input.abortSignal?.aborted) throw new Error("Run cancelled");
+
+      const t = event.type as string;
+
+      if (t === "response.output_text.delta") {
+        stepText += event.delta;
+        input.callbacks.onChunk(event.delta);
+      } else if (t === "response.output_item.added" && event.item?.type === "function_call") {
+        fnAccumulators.set(event.output_index, {
+          id: event.item.id ?? "",
+          callId: event.item.call_id ?? "",
+          name: event.item.name ?? "",
+          arguments: "",
+        });
+      } else if (t === "response.function_call_arguments.delta") {
+        const acc = fnAccumulators.get(event.output_index);
+        if (acc) acc.arguments += event.delta;
+      } else if (t === "response.output_item.done" && event.item?.type === "function_call") {
+        const acc = fnAccumulators.get(event.output_index);
+        if (acc) {
+          acc.id = event.item.id ?? acc.id;
+          acc.callId = event.item.call_id ?? acc.callId;
+          acc.name = event.item.name ?? acc.name;
+          acc.arguments = event.item.arguments ?? acc.arguments;
+          functionCalls.push({ ...acc });
+        }
+      } else if (t === "response.completed") {
+        const usage = event.response?.usage;
+        if (usage) {
+          stepInputTokens = usage.input_tokens ?? 0;
+          stepOutputTokens = usage.output_tokens ?? 0;
+        }
+      }
+    }
+
+    // No function calls → final answer
+    if (functionCalls.length === 0) {
+      finalText = stepText;
+      totalInputTokens += stepInputTokens;
+      totalOutputTokens += stepOutputTokens;
+      break;
+    }
+
+    totalInputTokens += stepInputTokens;
+    totalOutputTokens += stepOutputTokens;
+
+    // Emit intermediate text
+    if (stepText.trim()) {
+      input.callbacks.onText(stepText, { inputTokens: stepInputTokens, outputTokens: stepOutputTokens });
+    }
+
+    // Separate spawn_task (parallel) from sequential tools
+    const spawnTasks: CodexFnCall[] = [];
+    const sequentialFns: CodexFnCall[] = [];
+    for (const fc of functionCalls) {
+      if (fc.name === "spawn_task") spawnTasks.push(fc);
+      else sequentialFns.push(fc);
+    }
+
+    // Results map: callId → result
+    const resultsMap = new Map<string, string>();
+
+    // Run sequential tools
+    for (const fc of sequentialFns) {
+      if (input.abortSignal?.aborted) throw new Error("Run cancelled");
+      let parsedArgs: Record<string, unknown> = {};
+      try { parsedArgs = fc.arguments ? JSON.parse(fc.arguments) : {}; } catch { /* empty */ }
+      const detail = formatToolDetail(fc.name, parsedArgs);
+      const pendingId = input.callbacks.onToolStart(fc.name, detail, parsedArgs);
+      const t0 = Date.now();
+      const result = await executeTool(input.projectRoot, fc.name, parsedArgs, input.abortSignal, subAgentCtx, pendingId, input.callbacks.onTaskProgress);
+      input.callbacks.onToolEnd(pendingId, fc.name, detail, result, Date.now() - t0);
+      resultsMap.set(fc.callId, result);
+    }
+
+    // Run spawn_task calls in parallel
+    if (spawnTasks.length > 0) {
+      const maxConcurrent = input.settings.maxConcurrentTasks || 3;
+      const pendingIds = new Map<string, string>();
+      for (const fc of spawnTasks) {
+        let parsedArgs: Record<string, unknown> = {};
+        try { parsedArgs = fc.arguments ? JSON.parse(fc.arguments) : {}; } catch { /* empty */ }
+        const detail = formatToolDetail(fc.name, parsedArgs);
+        const pendingId = input.callbacks.onToolStart(fc.name, detail, parsedArgs);
+        pendingIds.set(fc.callId, pendingId);
+      }
+      for (let batch = 0; batch < spawnTasks.length; batch += maxConcurrent) {
+        const batchItems = spawnTasks.slice(batch, batch + maxConcurrent);
+        await Promise.all(batchItems.map(async (fc) => {
+          let parsedArgs: Record<string, unknown> = {};
+          try { parsedArgs = fc.arguments ? JSON.parse(fc.arguments) : {}; } catch { /* empty */ }
+          const t0 = Date.now();
+          const pId = pendingIds.get(fc.callId)!;
+          const result = await executeTool(input.projectRoot, fc.name, parsedArgs, input.abortSignal, subAgentCtx, pId, input.callbacks.onTaskProgress);
+          const detail = formatToolDetail(fc.name, parsedArgs);
+          input.callbacks.onToolEnd(pId, fc.name, detail, result, Date.now() - t0);
+          resultsMap.set(fc.callId, result);
+        }));
+      }
+    }
+
+    // Append assistant output + tool results to input for the next turn
+    // The Responses API expects function_call items followed by function_call_output items
+    if (stepText) {
+      inputItems.push({ role: "assistant", content: stepText });
+    }
+    for (const fc of functionCalls) {
+      inputItems.push({
+        type: "function_call",
+        id: fc.id,
+        call_id: fc.callId,
+        name: fc.name,
+        arguments: fc.arguments,
+      });
+      inputItems.push({
+        type: "function_call_output",
+        call_id: fc.callId,
+        output: resultsMap.get(fc.callId) || "",
+      });
+    }
+
+    if (step === maxToolSteps - 1) {
+      finalText = stepText || "Reached maximum tool steps. Please continue with a follow-up message.";
+    }
+  }
+
+  return { text: finalText, inputTokens: totalInputTokens, outputTokens: totalOutputTokens };
+}
+
+/* ── Codex OAuth sub-agent (Responses API, non-streaming) ── */
+
+async function runCodexOAuthSubAgent(
+  provider: ProviderConfig, credential: string, model: string, systemPrompt: string, userPrompt: string,
+  maxTokens: number, maxToolSteps: number, env: EnvironmentInfo, projectRoot: string, isExplore: boolean,
+  onProgress?: (detail: string) => void, abortSignal?: AbortSignal
+): Promise<string> {
+  const oauthData = await getValidOAuthData(credential, "codex");
+  const client = createCodexOAuthClient(oauthData);
+
+  const allChatTools = buildOpenAITools(env);
+  const fnName = (t: OpenAI.Chat.Completions.ChatCompletionTool) => t.type === "function" ? t.function.name : "";
+  const filteredChatTools = isExplore
+    ? allChatTools.filter((t) => EXPLORE_TOOLS.has(fnName(t)))
+    : allChatTools.filter((t) => { const n = fnName(t); return n !== "spawn_task" && n !== "load_skill" && n !== "memory_read" && n !== "memory_write"; });
+  const tools = toResponsesTools(filteredChatTools);
+
+  const inputItems: any[] = [{ role: "user", content: userPrompt }];
+  let finalText = "";
+
+  for (let step = 0; step < maxToolSteps; step++) {
+    if (abortSignal?.aborted) throw new Error("Run cancelled");
+
+    const response: any = await withTimeout(
+      client.responses.create(
+        {
+          model,
+          instructions: systemPrompt,
+          input: inputItems,
+          tools,
+          store: false, // Codex endpoint requires store=false
+        } as any,
+        { signal: abortSignal }
+      ),
+      SUB_AGENT_TIMEOUT_MS,
+      "Sub-agent Codex API call"
+    );
+
+    // Extract text and function calls from response output
+    let stepText = "";
+    const functionCalls: CodexFnCall[] = [];
+
+    for (const item of response.output || []) {
+      if (item.type === "message") {
+        for (const part of item.content || []) {
+          if (part.type === "output_text") stepText += part.text;
+        }
+      } else if (item.type === "function_call") {
+        functionCalls.push({
+          id: item.id || "",
+          callId: item.call_id || "",
+          name: item.name || "",
+          arguments: item.arguments || "",
+        });
+      }
+    }
+
+    if (functionCalls.length === 0) {
+      finalText = stepText;
+      break;
+    }
+
+    // Append assistant text to input
+    if (stepText) {
+      inputItems.push({ role: "assistant", content: stepText });
+    }
+
+    // Execute tools and append function_call + function_call_output to input
+    for (const fc of functionCalls) {
+      if (abortSignal?.aborted) throw new Error("Run cancelled");
+      let parsedArgs: Record<string, unknown> = {};
+      try { parsedArgs = fc.arguments ? JSON.parse(fc.arguments) : {}; } catch { /* empty */ }
+      onProgress?.(formatToolDetail(fc.name, parsedArgs));
+      const result = await executeTool(projectRoot, fc.name, parsedArgs, abortSignal);
+
+      inputItems.push({
+        type: "function_call",
+        id: fc.id,
+        call_id: fc.callId,
+        name: fc.name,
+        arguments: fc.arguments,
+      });
+      inputItems.push({
+        type: "function_call_output",
+        call_id: fc.callId,
+        output: result,
+      });
+    }
+
+    if (step === maxToolSteps - 1) finalText = stepText || "Reached max tool steps.";
+  }
+
+  return finalText;
+}
+
 /* ── Helpers ── */
 
 function formatToolDetail(name: string, args: Record<string, unknown>): string {
@@ -767,6 +1399,8 @@ function formatToolDetail(name: string, args: Record<string, unknown>): string {
   if (name === "glob") return `Finding ${String(args.pattern || "")}`;
   if (name === "grep") return `Searching for ${String(args.pattern || "")}`;
   if (name === "run_command") return `Running: ${String(args.command || "")}`;
+  if (name === "memory_read") return "Reading project memory";
+  if (name === "memory_write") return "Updating project memory";
   if (name === "load_skill") return `Loading skill: ${String(args.skill_id || "")}`;
   if (name === "spawn_task") return `Task: ${String(args.description || "Working...")}`;
   return name;
@@ -799,10 +1433,13 @@ async function runAnthropicAgent(
   }
 
   const env = getEnvironmentInfo();
-  const systemPrompt = buildSystemPrompt(env, input.projectRoot, input.enabledSkills, input.availableSkills);
+  const projectMemory = readProjectMemory(input.projectRoot);
+  const systemPrompt = buildSystemPrompt(env, input.projectRoot, input.enabledSkills, input.availableSkills, projectMemory);
   const tools = buildAnthropicTools(env, input.availableSkills);
 
-  const messages: Anthropic.MessageParam[] = toAnthropicMessages(input.history);
+  // Compact history if approaching context limits (~80% of 200K context window)
+  const compactedHistory = compactHistory(input.history, 150_000);
+  const messages: Anthropic.MessageParam[] = toAnthropicMessages(compactedHistory);
   const maxTokens = input.settings.maxTokens || DEFAULT_MAX_TOKENS;
   const maxToolSteps = input.settings.maxToolSteps || DEFAULT_MAX_TOOL_STEPS;
   let finalText = "";
@@ -996,19 +1633,22 @@ async function runOpenAIAgent(
 ): Promise<AgentResult> {
   const isOAuth = isOAuthCredential(credential);
 
-  let client: OpenAI;
+  // OAuth users → Codex Responses API (different endpoint + request format)
   if (isOAuth) {
-    const accessToken = await getValidOAuthToken(credential, "codex");
-    client = new OpenAI({ apiKey: accessToken, baseURL: "https://api.openai.com/v1" });
-  } else {
-    client = new OpenAI({ apiKey: credential });
+    return runCodexOAuthAgent(provider, credential, input);
   }
 
+  // API key users → standard Chat Completions API
+  const client = new OpenAI({ apiKey: credential });
+
   const env = getEnvironmentInfo();
-  const systemPrompt = buildSystemPrompt(env, input.projectRoot, input.enabledSkills, input.availableSkills);
+  const projectMemory = readProjectMemory(input.projectRoot);
+  const systemPrompt = buildSystemPrompt(env, input.projectRoot, input.enabledSkills, input.availableSkills, projectMemory);
   const tools = buildOpenAITools(env, input.availableSkills);
 
-  const messages = toOpenAIMessages(input.history, systemPrompt);
+  // Compact history (~80% of 128K context window)
+  const compactedHistory = compactHistory(input.history, 100_000);
+  const messages = toOpenAIMessages(compactedHistory, systemPrompt);
   const maxTokens = input.settings.maxTokens || DEFAULT_MAX_TOKENS;
   const maxToolSteps = input.settings.maxToolSteps || DEFAULT_MAX_TOOL_STEPS;
   let finalText = "";
@@ -1179,6 +1819,10 @@ export interface AgentResult {
 /* ── Main entry point ── */
 
 export async function runAgent(input: RunAgentInput): Promise<AgentResult> {
+  return runAgentInner(input);
+}
+
+async function runAgentInner(input: RunAgentInput): Promise<AgentResult> {
   const provider = input.providers.find((item) => item.enabled);
   if (!provider) {
     return { text: "No provider enabled. Configure Anthropic or Codex in settings.", inputTokens: 0, outputTokens: 0 };

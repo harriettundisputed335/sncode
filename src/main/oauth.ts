@@ -29,6 +29,49 @@ async function generateChallenge(verifier: string): Promise<string> {
   return base64UrlEncode(hash);
 }
 
+/* ── JWT helpers for Codex accountId extraction ── */
+
+interface IdTokenClaims {
+  chatgpt_account_id?: string;
+  organizations?: Array<{ id: string }>;
+  email?: string;
+  "https://api.openai.com/auth"?: {
+    chatgpt_account_id?: string;
+  };
+}
+
+function parseJwtClaims(token: string): IdTokenClaims | undefined {
+  const parts = token.split(".");
+  if (parts.length !== 3) return undefined;
+  try {
+    return JSON.parse(Buffer.from(parts[1], "base64url").toString()) as IdTokenClaims;
+  } catch {
+    return undefined;
+  }
+}
+
+function extractAccountIdFromClaims(claims: IdTokenClaims): string | undefined {
+  return (
+    claims.chatgpt_account_id ||
+    claims["https://api.openai.com/auth"]?.chatgpt_account_id ||
+    claims.organizations?.[0]?.id
+  );
+}
+
+/** Extract accountId from id_token or access_token JWT claims */
+export function extractAccountId(tokens: { id_token?: string; access_token?: string }): string | undefined {
+  if (tokens.id_token) {
+    const claims = parseJwtClaims(tokens.id_token);
+    const accountId = claims && extractAccountIdFromClaims(claims);
+    if (accountId) return accountId;
+  }
+  if (tokens.access_token) {
+    const claims = parseJwtClaims(tokens.access_token);
+    return claims ? extractAccountIdFromClaims(claims) : undefined;
+  }
+  return undefined;
+}
+
 /* ── Stored OAuth data shape ── */
 
 export interface OAuthData {
@@ -36,7 +79,7 @@ export interface OAuthData {
   access: string;
   refresh: string;
   expires: number;           // timestamp ms
-  accountId?: string;        // for codex
+  accountId?: string;        // for codex (ChatGPT-Account-Id header)
 }
 
 const OAUTH_KEY_PREFIX = "oauth:";
@@ -231,11 +274,15 @@ export async function pollCodexDeviceAuth(
         id_token?: string;
       };
 
+      // Extract accountId from JWT claims (id_token or access_token)
+      const accountId = extractAccountId(tokens);
+
       const data: OAuthData = {
         type: "oauth",
         access: tokens.access_token,
         refresh: tokens.refresh_token,
         expires: Date.now() + (tokens.expires_in ?? 3600) * 1000,
+        accountId,
       };
 
       await setOAuthData("codex", data);
@@ -264,12 +311,15 @@ export async function refreshCodexToken(current: OAuthData): Promise<OAuthData> 
 
   if (!response.ok) throw new Error(`Codex token refresh failed: ${response.status}`);
 
-  const json = await response.json() as { access_token: string; refresh_token: string; expires_in?: number };
+  const json = await response.json() as { access_token: string; refresh_token: string; expires_in?: number; id_token?: string };
+  // Try to extract a fresh accountId from the refreshed tokens, fall back to existing
+  const newAccountId = extractAccountId({ access_token: json.access_token, id_token: json.id_token }) || current.accountId;
   const data: OAuthData = {
     type: "oauth",
     access: json.access_token,
     refresh: json.refresh_token,
     expires: Date.now() + (json.expires_in ?? 3600) * 1000,
+    accountId: newAccountId,
   };
 
   await setOAuthData("codex", data);

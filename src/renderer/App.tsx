@@ -1,4 +1,4 @@
-import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import React, { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import hljs from "highlight.js/lib/core";
@@ -52,7 +52,7 @@ hljs.registerLanguage("cpp", cpp);
 hljs.registerLanguage("c", cpp);
 
 import { AgentSettings, AppState, FileTreeEntry, GitDiffEntry, GitStatusInfo, ImageAttachment, ImageMediaType, ProviderId, ProviderConfig, Project, ThinkingLevel, ThreadMessage, TodoItem } from "../shared/types";
-import { ALL_MODELS, API_KEY_URLS, labelForModelId, providerForModelId } from "../shared/models";
+import { ALL_MODELS, API_KEY_URLS, labelForModelId, providerForModelId, modelEntryById, estimateCost } from "../shared/models";
 import SettingsModal from "./SettingsModal";
 
 /* ── constants ── */
@@ -130,27 +130,42 @@ async function fileToImageAttachment(file: File): Promise<ImageAttachment | null
 
 /* ── Markdown renderer ── */
 
-function Markdown({ content }: { content: string }) {
+function highlightChildren(children: React.ReactNode, query: string): React.ReactNode {
+  if (!query) return children;
+  return React.Children.map(children, (child) => {
+    if (typeof child === "string") {
+      return <HighlightText text={child} query={query} />;
+    }
+    if (React.isValidElement<{ children?: React.ReactNode }>(child) && child.props.children) {
+      return React.cloneElement(child, {}, highlightChildren(child.props.children, query));
+    }
+    return child;
+  });
+}
+
+function Markdown({ content, searchHighlight }: { content: string; searchHighlight?: string }) {
+  const q = searchHighlight?.trim() || "";
+  const wrap = (children: React.ReactNode) => (q ? highlightChildren(children, q) : children);
   return (
     <ReactMarkdown
       remarkPlugins={[remarkGfm]}
       components={{
-        p: ({ children }) => <p className="mb-3 last:mb-0 leading-[1.7]">{children}</p>,
-        h1: ({ children }) => <h1 className="mb-2 mt-5 text-[17px] font-bold text-[var(--text-primary)]">{children}</h1>,
-        h2: ({ children }) => <h2 className="mb-2 mt-4 text-[15px] font-semibold text-[var(--text-primary)]">{children}</h2>,
-        h3: ({ children }) => <h3 className="mb-1.5 mt-3 text-[14px] font-semibold text-[var(--text-primary)]">{children}</h3>,
-        h4: ({ children }) => <h4 className="mb-1 mt-2 text-[13px] font-semibold text-[var(--text-primary)]">{children}</h4>,
+        p: ({ children }) => <p className="mb-3 last:mb-0 leading-[1.7]">{wrap(children)}</p>,
+        h1: ({ children }) => <h1 className="mb-2 mt-5 text-[17px] font-bold text-[var(--text-primary)]">{wrap(children)}</h1>,
+        h2: ({ children }) => <h2 className="mb-2 mt-4 text-[15px] font-semibold text-[var(--text-primary)]">{wrap(children)}</h2>,
+        h3: ({ children }) => <h3 className="mb-1.5 mt-3 text-[14px] font-semibold text-[var(--text-primary)]">{wrap(children)}</h3>,
+        h4: ({ children }) => <h4 className="mb-1 mt-2 text-[13px] font-semibold text-[var(--text-primary)]">{wrap(children)}</h4>,
         ul: ({ children }) => <ul className="mb-3 ml-5 list-disc space-y-1">{children}</ul>,
         ol: ({ children }) => <ol className="mb-3 ml-5 list-decimal space-y-1">{children}</ol>,
-        li: ({ children }) => <li className="leading-[1.65]">{children}</li>,
+        li: ({ children }) => <li className="leading-[1.65]">{wrap(children)}</li>,
         a: ({ href, children }) => (
           <a href={href} className="text-blue-400 underline decoration-blue-400/30 hover:decoration-blue-400" target="_blank" rel="noreferrer">
-            {children}
+            {wrap(children)}
           </a>
         ),
-        blockquote: ({ children }) => <blockquote className="my-2 border-l-2 border-[var(--border-active)] pl-3 text-[var(--text-muted)]">{children}</blockquote>,
-        strong: ({ children }) => <strong className="font-semibold text-[var(--text-primary)]">{children}</strong>,
-        em: ({ children }) => <em className="text-[var(--text-secondary)]">{children}</em>,
+        blockquote: ({ children }) => <blockquote className="my-2 border-l-2 border-[var(--border-active)] pl-3 text-[var(--text-muted)]">{wrap(children)}</blockquote>,
+        strong: ({ children }) => <strong className="font-semibold text-[var(--text-primary)]">{wrap(children)}</strong>,
+        em: ({ children }) => <em className="text-[var(--text-secondary)]">{wrap(children)}</em>,
         hr: () => <hr className="my-4 border-[var(--border)]" />,
         pre: ({ children }) => (
           <div className="group/code relative my-3 overflow-hidden rounded-lg border border-[var(--border-subtle)] bg-[var(--bg-code)]">
@@ -178,15 +193,15 @@ function Markdown({ content }: { content: string }) {
               />
             );
           }
-          return <code className="rounded bg-[var(--bg-user-bubble)] px-1.5 py-0.5 text-[12px] font-mono text-[var(--text-primary)]">{children}</code>;
+          return <code className="rounded bg-[var(--bg-user-bubble)] px-1.5 py-0.5 text-[12px] font-mono text-[var(--text-primary)]">{wrap(children)}</code>;
         },
         table: ({ children }) => (
           <div className="my-3 overflow-x-auto">
             <table className="w-full border-collapse text-[13px]">{children}</table>
           </div>
         ),
-        th: ({ children }) => <th className="border border-[var(--border-strong)] bg-[var(--bg-card)] px-3 py-1.5 text-left text-[12px] font-medium text-[var(--text-heading)]">{children}</th>,
-        td: ({ children }) => <td className="border border-[var(--border)] px-3 py-1.5">{children}</td>,
+        th: ({ children }) => <th className="border border-[var(--border-strong)] bg-[var(--bg-card)] px-3 py-1.5 text-left text-[12px] font-medium text-[var(--text-heading)]">{wrap(children)}</th>,
+        td: ({ children }) => <td className="border border-[var(--border)] px-3 py-1.5">{wrap(children)}</td>,
       }}
     >
       {content}
@@ -717,16 +732,17 @@ function RightSidebarFileView({ filePath, content, onClose }: { filePath: string
 
   return (
     <div className="flex h-full flex-col">
-      <div className="flex items-center gap-2 border-b border-[var(--border)] px-3 py-2">
+      <div className="flex items-center gap-3 px-5 py-3.5">
         <FileIcon name={filePath} />
-        <span className="min-w-0 flex-1 truncate text-[12px] text-[var(--text-label)]">{filePath}</span>
-        <button onClick={onClose} className="text-[var(--text-dim)] transition hover:text-[var(--text-muted)]"><XIcon /></button>
+        <span className="min-w-0 flex-1 truncate text-[13px] font-medium text-[var(--text-primary)]">{filePath}</span>
+        <button onClick={onClose} className="grid h-7 w-7 place-items-center rounded-lg text-[var(--text-dim)] transition hover:bg-[var(--bg-hover)] hover:text-[var(--text-muted)]"><XIcon /></button>
       </div>
+      <div className="h-px bg-[var(--divider)]" />
       <div className="min-h-0 flex-1 overflow-auto">
         {isError ? (
-          <div className="p-4 text-[12px] text-red-400">{content}</div>
+          <div className="p-5 text-[12px] text-red-400">{content}</div>
         ) : (
-          <pre className="p-3 text-[12px] leading-relaxed text-[var(--text-secondary)]">
+          <pre className="p-4 text-[12px] leading-relaxed text-[var(--text-secondary)]">
             <code dangerouslySetInnerHTML={{ __html: highlighted }} />
           </pre>
         )}
@@ -819,18 +835,19 @@ function RightSidebarDiffView({ diffs, onClose }: { diffs: GitDiffEntry[]; onClo
   return (
     <div className="flex h-full flex-col">
       {/* Header */}
-      <div className="flex items-center gap-2 border-b border-[var(--border)] px-3 py-2.5">
+      <div className="flex items-center gap-3 px-5 py-3.5">
         <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="shrink-0 text-[var(--text-muted)]">
           <path d="M6 3v12" /><circle cx="18" cy="6" r="3" /><circle cx="6" cy="18" r="3" /><path d="M18 9a9 9 0 0 1-9 9" />
         </svg>
-        <span className="min-w-0 flex-1 text-[12px] font-medium text-[var(--text-secondary)]">Changes</span>
+        <span className="min-w-0 flex-1 text-[13px] font-semibold text-[var(--text-primary)]">Changes</span>
         <div className="flex items-center gap-1.5 text-[10px]">
           {modCount > 0 && <span className="text-amber-400">{modCount}M</span>}
           {addCount > 0 && <span className="text-emerald-400">+{addCount}</span>}
           {delCount > 0 && <span className="text-red-400">-{delCount}</span>}
         </div>
-        <button onClick={onClose} className="text-[var(--text-dim)] transition hover:text-[var(--text-muted)]"><XIcon /></button>
+        <button onClick={onClose} className="grid h-7 w-7 place-items-center rounded-lg text-[var(--text-dim)] transition hover:bg-[var(--bg-hover)] hover:text-[var(--text-muted)]"><XIcon /></button>
       </div>
+      <div className="h-px bg-[var(--divider)]" />
 
       {diffs.length === 0 ? (
         <div className="flex flex-1 flex-col items-center justify-center gap-2 p-6">
@@ -945,61 +962,78 @@ function RightSidebarSubAgent({ msg, onClose }: { msg: ThreadMessage; onClose: (
   const duration = msg.metadata?.taskDurationMs;
   const trail = msg.metadata?.taskTrail || [];
   const result = msg.content;
+  const trailEndRef = useRef<HTMLDivElement>(null);
+
+  // Auto-scroll trail to bottom when new entries arrive
+  useEffect(() => {
+    trailEndRef.current?.scrollIntoView({ behavior: "smooth" });
+  }, [trail.length]);
 
   const typeBadge = taskType === "explore"
-    ? { label: "explore", color: "text-cyan-400 border-cyan-400/30 bg-cyan-400/5" }
-    : { label: "general", color: "text-orange-400 border-orange-400/30 bg-orange-400/5" };
+    ? { label: "explore", color: "text-cyan-400 bg-cyan-400/10" }
+    : { label: "general", color: "text-orange-400 bg-orange-400/10" };
 
   return (
     <div className="flex h-full flex-col">
-      <div className="flex items-center gap-2 border-b border-[var(--border)] px-3 py-2">
-        <div className={`h-2 w-2 shrink-0 rounded-full ${pending ? "bg-amber-400/80 animate-pulse" : "bg-emerald-500/70"}`} />
-        <span className="min-w-0 flex-1 text-[12px] font-medium text-[var(--text-label)]">{description}</span>
-        <span className={`rounded border px-1.5 py-px text-[9px] font-medium ${typeBadge.color}`}>{typeBadge.label}</span>
-        <button onClick={onClose} className="text-[var(--text-dim)] transition hover:text-[var(--text-muted)]"><XIcon /></button>
+      {/* Header */}
+      <div className="flex items-center gap-3 px-5 py-3.5">
+        <div className={`h-2.5 w-2.5 shrink-0 rounded-full ${pending ? "bg-amber-400 animate-pulse" : "bg-emerald-500"}`} />
+        <div className="min-w-0 flex-1">
+          <div className="text-[13px] font-semibold text-[var(--text-primary)] truncate">{description}</div>
+          <div className="flex items-center gap-2 mt-0.5">
+            <span className={`rounded-full px-2 py-0.5 text-[10px] font-medium ${typeBadge.color}`}>{typeBadge.label}</span>
+            <span className={`text-[11px] ${pending ? "text-amber-400" : "text-emerald-400"}`}>{pending ? "Running" : "Completed"}</span>
+            {!pending && duration !== undefined && (
+              <span className="text-[10px] text-[var(--text-dimmer)]">{formatDuration(duration)}</span>
+            )}
+          </div>
+        </div>
+        <button onClick={onClose} className="grid h-7 w-7 place-items-center rounded-lg text-[var(--text-dim)] transition hover:bg-[var(--bg-hover)] hover:text-[var(--text-muted)]"><XIcon /></button>
       </div>
 
-      {/* Trail */}
+      <div className="h-px bg-[var(--divider)]" />
+
+      {/* Activity Trail */}
       {trail.length > 0 && (
-        <div className="border-b border-[var(--border-subtle)] px-3 py-2">
-          <div className="text-[10px] font-medium text-[var(--text-dim)] mb-1.5">Activity Trail</div>
-          <div className="space-y-1 max-h-[200px] overflow-auto">
+        <div className="shrink-0 px-5 py-3" style={{ maxHeight: pending ? "50%" : "35%" }}>
+          <div className="mb-2 text-[10px] font-semibold uppercase tracking-wider text-[var(--text-dim)]">Activity</div>
+          <div className="space-y-0.5 overflow-auto pr-1" style={{ maxHeight: "calc(100% - 24px)" }}>
             {trail.map((entry, i) => (
-              <div key={i} className="flex items-center gap-2 text-[11px]">
-                <div className={`h-1 w-1 rounded-full ${entry.type === "tool" ? "bg-blue-400/70" : "bg-[var(--text-dim)]"}`} />
-                <span className="text-[var(--text-muted)] truncate">{entry.summary}</span>
-                <span className="ml-auto shrink-0 text-[9px] text-[var(--text-dimmest)]">{new Date(entry.timestamp).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" })}</span>
+              <div key={i} className="group flex items-start gap-2.5 rounded-lg px-2 py-1.5 transition hover:bg-[var(--bg-hover)]">
+                <div className="mt-1.5 flex flex-col items-center">
+                  <div className={`h-1.5 w-1.5 rounded-full ${entry.type === "tool" ? "bg-blue-400" : "bg-[var(--text-dimmer)]"}`} />
+                  {i < trail.length - 1 && <div className="mt-0.5 h-3 w-px bg-[var(--border-subtle)]" />}
+                </div>
+                <div className="min-w-0 flex-1">
+                  <span className="text-[11px] text-[var(--text-secondary)] break-all">{entry.summary}</span>
+                </div>
+                <span className="shrink-0 text-[9px] text-[var(--text-dimmest)] mt-0.5">{new Date(entry.timestamp).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" })}</span>
               </div>
             ))}
+            <div ref={trailEndRef} />
           </div>
         </div>
       )}
 
-      {/* Status */}
-      <div className="px-3 py-2 border-b border-[var(--border-subtle)]">
-        <div className="flex items-center gap-2 text-[11px]">
-          <span className="text-[var(--text-dim)]">Status:</span>
-          <span className={pending ? "text-amber-400" : "text-emerald-400"}>{pending ? "Running" : "Completed"}</span>
-          {!pending && duration !== undefined && (
-            <span className="ml-auto text-[10px] text-[var(--text-dimmer)]">{formatDuration(duration)}</span>
-          )}
-        </div>
-      </div>
+      {(trail.length > 0 || pending) && <div className="h-px bg-[var(--divider)]" />}
 
-      {/* Result */}
-      <div className="min-h-0 flex-1 overflow-auto p-3">
+      {/* Result / Working indicator */}
+      <div className="min-h-0 flex-1 overflow-auto px-5 py-4">
         {pending ? (
-          <div className="flex items-center gap-2">
-            <div className="flex gap-[3px]">
-              <div className="h-1 w-1 animate-bounce rounded-full bg-[var(--text-dimmer)]" style={{ animationDelay: "0ms" }} />
-              <div className="h-1 w-1 animate-bounce rounded-full bg-[var(--text-dimmer)]" style={{ animationDelay: "150ms" }} />
-              <div className="h-1 w-1 animate-bounce rounded-full bg-[var(--text-dimmer)]" style={{ animationDelay: "300ms" }} />
+          <div className="flex flex-col items-center justify-center gap-3 py-8">
+            <div className="flex gap-1">
+              <div className="h-1.5 w-1.5 animate-bounce rounded-full bg-[var(--text-dim)]" style={{ animationDelay: "0ms" }} />
+              <div className="h-1.5 w-1.5 animate-bounce rounded-full bg-[var(--text-dim)]" style={{ animationDelay: "150ms" }} />
+              <div className="h-1.5 w-1.5 animate-bounce rounded-full bg-[var(--text-dim)]" style={{ animationDelay: "300ms" }} />
             </div>
-            <span className="text-[11px] text-[var(--text-dimmer)]">Sub-agent working...</span>
+            <span className="text-[12px] text-[var(--text-dimmer)]">Sub-agent working...</span>
           </div>
         ) : result ? (
-          <div className="text-[12px] leading-relaxed text-[var(--text-muted)]">
-            <Markdown content={result} />
+          <div>
+            <div className="mb-2 text-[10px] font-semibold uppercase tracking-wider text-[var(--text-dim)]">Result</div>
+            <div className="text-[13px] leading-relaxed text-[var(--text-secondary)]">
+              <Markdown content={result} />
+            </div>
           </div>
         ) : (
           <div className="text-[12px] text-[var(--text-dim)]">No result yet</div>
@@ -1595,13 +1629,13 @@ export default function App() {
   const [gitBranches, setGitBranches] = useState<string[]>([]);
   const [currentBranch, setCurrentBranch] = useState("");
   const [gitStatus, setGitStatus] = useState<GitStatusInfo>({ changes: 0, staged: 0, isRepo: false });
-  // Right sidebar state
+  // Right sidebar state — subagent uses msgId for live reactivity (reads from state.messages)
   const [rightSidebar, setRightSidebar] = useState<{
     type: "file" | "diff" | "subagent";
     filePath?: string;
     fileContent?: string;
     diffs?: GitDiffEntry[];
-    taskMsg?: ThreadMessage;
+    taskMsgId?: string;
   } | null>(null);
   // Git actions dropdown
   const [showGitActions, setShowGitActions] = useState(false);
@@ -1630,6 +1664,31 @@ export default function App() {
   const selProject = useMemo(() => state.projects.find((p) => p.id === selProjectId) ?? null, [state.projects, selProjectId]);
   const selThread = useMemo(() => state.threads.find((t) => t.id === selThreadId) ?? null, [state.threads, selThreadId]);
   const threadMessages = useMemo(() => state.messages.filter((m) => m.threadId === selThreadId), [state.messages, selThreadId]);
+
+  // Comprehensive thread stats: tokens, tool calls, context, pricing
+  const threadStats = useMemo(() => {
+    let inputTokens = 0, outputTokens = 0, toolCalls = 0, userMsgs = 0, assistantMsgs = 0;
+    let contextChars = 0;
+    for (const m of threadMessages) {
+      if (m.metadata?.inputTokens) inputTokens += m.metadata.inputTokens;
+      if (m.metadata?.outputTokens) outputTokens += m.metadata.outputTokens;
+      if (m.metadata?.toolName) toolCalls++;
+      if (m.role === "user") userMsgs++;
+      if (m.role === "assistant" && !m.metadata?.toolName) assistantMsgs++;
+      contextChars += m.content.length;
+      if (m.images) for (const img of m.images) contextChars += img.data.length * 0.75;
+    }
+    const totalTokens = inputTokens + outputTokens;
+    const contextTokens = Math.round(contextChars / 4);
+    // Get active model for pricing + context window
+    const activeProvider = state.providers.find((p) => p.enabled);
+    const modelId = activeProvider?.model || "";
+    const modelEntry = modelEntryById(modelId);
+    const contextWindow = modelEntry?.contextWindow || 200_000;
+    const contextPct = contextWindow > 0 ? Math.min(100, Math.round((contextTokens / contextWindow) * 100)) : 0;
+    const cost = estimateCost(modelId, inputTokens, outputTokens);
+    return { inputTokens, outputTokens, totalTokens, toolCalls, userMsgs, assistantMsgs, contextTokens, contextWindow, contextPct, cost, modelId };
+  }, [threadMessages, state.providers]);
 
   /* ── effects ── */
 
@@ -1823,10 +1882,15 @@ export default function App() {
     setShowModelPicker(false);
     const targetProvider = providerForModelId(modelId);
     if (!targetProvider) return;
-    for (const p of state.providers) {
-      if (p.id === targetProvider) await updateProvider(p, { enabled: true, model: modelId });
-      else if (p.enabled) await updateProvider(p, { enabled: false });
-    }
+    const batch = state.providers
+      .filter((p) => p.id === targetProvider || p.enabled)
+      .map((p) => p.id === targetProvider
+        ? { id: p.id, enabled: true, model: modelId }
+        : { id: p.id, enabled: false }
+      );
+    if (batch.length === 0) return;
+    const providers = await window.sncode.updateProviderBatch(batch);
+    setState((prev) => ({ ...prev, providers }));
   }
 
   async function send(e: FormEvent) {
@@ -1844,7 +1908,12 @@ export default function App() {
     // Snap to bottom when user sends a message
     isNearBottomRef.current = true;
     try {
-      const next = await window.sncode.sendMessage({ threadId: selThreadId, content, images });
+      const next = await window.sncode.sendMessage({
+        threadId: selThreadId,
+        content,
+        images,
+        permissionMode: permission,
+      });
       setState(next);
     } catch {
       setRunningThreads((prev) => { const next = new Set(prev); next.delete(selThreadId!); return next; });
@@ -1882,7 +1951,7 @@ export default function App() {
   }
 
   function openSubAgentInSidebar(msg: ThreadMessage) {
-    setRightSidebar({ type: "subagent", taskMsg: msg });
+    setRightSidebar({ type: "subagent", taskMsgId: msg.id });
   }
 
   // Todo system
@@ -1955,7 +2024,7 @@ export default function App() {
       {/* ─── Sidebar ─── */}
       <aside className="flex w-[260px] shrink-0 flex-col">
         <div className="drag-region flex h-12 shrink-0 items-center px-4 pt-1">
-          <div className="no-drag flex items-center gap-1.5">
+          <div className="no-drag flex items-center">
             <span className="text-[14px] font-bold tracking-tight"><span className="text-[var(--brand-sn)]">Sn</span><span className="text-[var(--brand-code)]">Code</span></span>
           </div>
           <button onClick={() => setShowSettings(true)} className="no-drag ml-auto grid h-7 w-7 place-items-center rounded-lg text-[var(--text-dim)] transition hover:bg-[var(--bg-elevated)] hover:text-[var(--text-muted)]" title="Settings"><GearIcon /></button>
@@ -2013,6 +2082,13 @@ export default function App() {
                         </div>
                       );
                     })}
+                    <button
+                      onClick={() => addThread(project)}
+                      className="flex w-full items-center gap-1.5 rounded-lg px-2.5 py-[6px] text-left text-[12px] text-[var(--text-dimmer)] transition hover:bg-[var(--bg-card)] hover:text-[var(--text-muted)]"
+                    >
+                      <svg width="10" height="10" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="2" className="shrink-0"><path d="M8 2v12M2 8h12" /></svg>
+                      New thread
+                    </button>
                   </div>
                 )}
               </div>
@@ -2063,7 +2139,7 @@ export default function App() {
       </aside>
 
       {/* ─── Main content (floating card) ─── */}
-      <main className="flex min-h-0 flex-1 flex-col py-2 pr-2">
+      <main className="flex min-h-0 min-w-0 flex-1 flex-col py-2 pr-2">
         <div className="flex min-h-0 flex-1 flex-col overflow-hidden rounded-xl" style={{ border: "1px solid var(--border)", background: "var(--bg-card)" }}>
 
           {/* Top bar */}
@@ -2226,7 +2302,7 @@ export default function App() {
                         ) : (
                           <div>
                             <div className={`text-[13px] ${isError ? "text-red-400/90" : "text-[var(--text-secondary)]"}`}>
-                              <Markdown content={msg.content} />
+                              <Markdown content={msg.content} searchHighlight={searchHighlight} />
                             </div>
                             <div className="mt-0.5 flex items-center gap-2 text-[10px] text-[var(--text-dimmest)]">
                               <span>{new Date(msg.createdAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}</span>
@@ -2393,33 +2469,104 @@ export default function App() {
               </div>
             </form>
           </div>
+
+          {/* ─── Bottom stats bar ─── */}
+          {threadStats.totalTokens > 0 && (
+            <div className="flex shrink-0 items-center gap-3 border-t border-[var(--border)] px-4 py-1.5">
+              {/* Context usage bar */}
+              <div className="flex items-center gap-1.5" title={`Context: ~${threadStats.contextTokens.toLocaleString()} / ${threadStats.contextWindow.toLocaleString()} tokens`}>
+                <span className="text-[10px] text-[var(--text-dimmest)]">CTX</span>
+                <div className="h-1.5 w-16 overflow-hidden rounded-full bg-[var(--bg-active)]">
+                  <div
+                    className={`h-full rounded-full transition-all ${threadStats.contextPct > 80 ? "bg-red-500" : threadStats.contextPct > 50 ? "bg-amber-500" : "bg-emerald-500"}`}
+                    style={{ width: `${threadStats.contextPct}%` }}
+                  />
+                </div>
+                <span className="text-[10px] text-[var(--text-dimmest)]">{threadStats.contextPct}%</span>
+              </div>
+
+              <div className="h-3 w-px bg-[var(--bg-active)]" />
+
+              {/* Token counts */}
+              <div className="flex items-center gap-1" title={`Input: ${threadStats.inputTokens.toLocaleString()} | Output: ${threadStats.outputTokens.toLocaleString()}`}>
+                <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="text-[var(--text-dimmest)]"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>
+                <span className="text-[10px] text-[var(--text-dimmest)]">
+                  <span className="text-[var(--text-dimmer)]">{threadStats.inputTokens.toLocaleString()}</span>
+                  <span className="mx-0.5">/</span>
+                  <span className="text-[var(--text-dimmer)]">{threadStats.outputTokens.toLocaleString()}</span>
+                  <span className="ml-0.5">tok</span>
+                </span>
+              </div>
+
+              <div className="h-3 w-px bg-[var(--bg-active)]" />
+
+              {/* Tool calls */}
+              <div className="flex items-center gap-1" title={`${threadStats.toolCalls} tool calls | ${threadStats.userMsgs} user msgs | ${threadStats.assistantMsgs} assistant msgs`}>
+                <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="text-[var(--text-dimmest)]"><path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z"/></svg>
+                <span className="text-[10px] text-[var(--text-dimmer)]">{threadStats.toolCalls}</span>
+              </div>
+
+              <div className="h-3 w-px bg-[var(--bg-active)]" />
+
+              {/* Messages */}
+              <div className="flex items-center gap-1" title={`${threadStats.userMsgs} turns`}>
+                <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="text-[var(--text-dimmest)]"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
+                <span className="text-[10px] text-[var(--text-dimmer)]">{threadStats.userMsgs}</span>
+              </div>
+
+              {/* Cost estimate (only show for API key models with pricing) */}
+              {threadStats.cost > 0 && (
+                <>
+                  <div className="h-3 w-px bg-[var(--bg-active)]" />
+                  <div className="flex items-center gap-1" title={`Estimated cost based on ${labelForModelId(threadStats.modelId)} API pricing`}>
+                    <span className="text-[10px] text-[var(--text-dimmest)]">~$</span>
+                    <span className="text-[10px] text-[var(--text-dimmer)]">{threadStats.cost < 0.01 ? threadStats.cost.toFixed(4) : threadStats.cost.toFixed(2)}</span>
+                  </div>
+                </>
+              )}
+
+              {/* OAuth free indicator for Codex */}
+              {threadStats.totalTokens > 0 && threadStats.cost === 0 && modelEntryById(threadStats.modelId)?.provider === "codex" && (
+                <>
+                  <div className="h-3 w-px bg-[var(--bg-active)]" />
+                  <span className="text-[10px] text-emerald-500">free (subscription)</span>
+                </>
+              )}
+            </div>
+          )}
         </div>
       </main>
 
-      {/* ─── Right Sidebar ─── */}
-      {rightSidebar && (
-        <div className="flex w-[380px] shrink-0 flex-col border-l border-[var(--border-subtle)] bg-[var(--bg-surface)]">
-          {rightSidebar.type === "file" && rightSidebar.filePath && (
-            <RightSidebarFileView
-              filePath={rightSidebar.filePath}
-              content={rightSidebar.fileContent || ""}
-              onClose={() => setRightSidebar(null)}
-            />
-          )}
-          {rightSidebar.type === "diff" && (
-            <RightSidebarDiffView
-              diffs={rightSidebar.diffs || []}
-              onClose={() => setRightSidebar(null)}
-            />
-          )}
-          {rightSidebar.type === "subagent" && rightSidebar.taskMsg && (
-            <RightSidebarSubAgent
-              msg={rightSidebar.taskMsg}
-              onClose={() => setRightSidebar(null)}
-            />
-          )}
-        </div>
-      )}
+      {/* ─── Right Panel ─── */}
+      {rightSidebar && (() => {
+        const isSubagent = rightSidebar.type === "subagent";
+        const liveTaskMsg = isSubagent && rightSidebar.taskMsgId ? state.messages.find((m) => m.id === rightSidebar.taskMsgId) : undefined;
+        return (
+          <div className={`flex min-w-0 flex-col ${isSubagent ? "w-[40vw] max-w-[560px] min-w-[320px]" : "w-[30vw] max-w-[420px] min-w-[280px]"}`}>
+            <div className="flex flex-1 flex-col m-2 ml-0 rounded-2xl border border-[var(--border)] bg-[var(--bg-card)] shadow-lg overflow-hidden">
+              {rightSidebar.type === "file" && rightSidebar.filePath && (
+                <RightSidebarFileView
+                  filePath={rightSidebar.filePath}
+                  content={rightSidebar.fileContent || ""}
+                  onClose={() => setRightSidebar(null)}
+                />
+              )}
+              {rightSidebar.type === "diff" && (
+                <RightSidebarDiffView
+                  diffs={rightSidebar.diffs || []}
+                  onClose={() => setRightSidebar(null)}
+                />
+              )}
+              {isSubagent && liveTaskMsg && (
+                <RightSidebarSubAgent
+                  msg={liveTaskMsg}
+                  onClose={() => setRightSidebar(null)}
+                />
+              )}
+            </div>
+          </div>
+        );
+      })()}
 
       {/* ─── Commit modal ─── */}
       {showCommitModal && (

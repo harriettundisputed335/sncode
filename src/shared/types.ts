@@ -61,6 +61,8 @@ export interface Thread {
   id: string;
   projectId: string;
   title: string;
+  /** Backing Codex app-server thread id (when using codex provider integration) */
+  codexThreadId?: string;
   createdAt: string;
   updatedAt: string;
 }
@@ -119,6 +121,8 @@ export interface SendMessageInput {
   threadId: string;
   content: string;
   images?: ImageAttachment[];
+  /** UI permission mode for this run (maps to app-server approvals for codex provider) */
+  permissionMode?: "full" | "approve";
 }
 
 export interface ProviderUpdateInput {
@@ -244,6 +248,7 @@ export interface SncodeApi {
   createThread: (payload: NewThreadInput) => Promise<Thread>;
   deleteThread: (threadId: string) => Promise<AppState>;
   updateProvider: (payload: ProviderUpdateInput) => Promise<ProviderConfig[]>;
+  updateProviderBatch: (payload: ProviderUpdateInput[]) => Promise<ProviderConfig[]>;
   setProviderCredential: (payload: ProviderCredentialInput) => Promise<ProviderConfig[]>;
   sendMessage: (payload: SendMessageInput) => Promise<AppState>;
   cancelRun: (threadId: string) => Promise<void>;

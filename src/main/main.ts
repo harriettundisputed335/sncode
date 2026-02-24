@@ -1,8 +1,9 @@
+import { z } from "zod";
 import { execFile } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import { promisify } from "node:util";
-import { BrowserWindow, Menu, app, dialog, ipcMain, shell } from "electron";
+import { BrowserWindow, Menu, app, dialog, ipcMain, shell, type MessageBoxOptions } from "electron";
 
 const execFileAsync = promisify(execFile);
 import Anthropic from "@anthropic-ai/sdk";
@@ -12,11 +13,13 @@ import { clearAllCredentials, getProviderCredential, setProviderCredential } fro
 import { exchangeAnthropicCode, pollCodexDeviceAuth, startAnthropicOAuth, startCodexDeviceFlow, isOAuthCredential, parseOAuthCredential, refreshAnthropicToken, refreshCodexToken } from "./oauth";
 import { discoverSkills, loadSkillContent, installSkill, deleteSkill } from "./skills";
 import { Store } from "./store";
+import { runCodexAppServerTurn } from "./codex-app-server";
 import {
   agentSettingsSchema,
   newProjectInputSchema,
   newThreadInputSchema,
   providerCredentialInputSchema,
+  providerUpdateBatchInputSchema,
   providerUpdateInputSchema,
   sendMessageInputSchema
 } from "../shared/schema";
@@ -173,6 +176,269 @@ async function generateTitle(content: string, providers: ProviderConfig[]): Prom
   return truncateTitle(content);
 }
 
+
+async function promptCodexCommandApproval(params: { command?: string | null; cwd?: string | null; reason?: string | null }) {
+  const win = BrowserWindow.getFocusedWindow() ?? mainWindow ?? undefined;
+  const detailLines = [
+    params.reason ? `Reason: ${params.reason}` : null,
+    params.cwd ? `CWD: ${params.cwd}` : null,
+    params.command ? `Command: ${params.command}` : null,
+  ].filter(Boolean) as string[];
+
+  const opts: MessageBoxOptions = {
+    type: "question",
+    buttons: ["Approve", "Decline", "Cancel Run"],
+    defaultId: 0,
+    cancelId: 2,
+    noLink: true,
+    title: "SnCode Approval",
+    message: "Codex app-server is requesting permission to run a command.",
+    detail: detailLines.join("\n"),
+  };
+  const res = win ? await dialog.showMessageBox(win, opts) : await dialog.showMessageBox(opts);
+
+  if (res.response === 0) return "accept" as const;
+  if (res.response === 1) return "decline" as const;
+  return "cancel" as const;
+}
+
+async function promptCodexFileChangeApproval(params: { reason?: string | null; grantRoot?: string | null }) {
+  const win = BrowserWindow.getFocusedWindow() ?? mainWindow ?? undefined;
+  const detailLines = [
+    params.reason ? `Reason: ${params.reason}` : null,
+    params.grantRoot ? `Grant root: ${params.grantRoot}` : null,
+  ].filter(Boolean) as string[];
+
+  const opts: MessageBoxOptions = {
+    type: "question",
+    buttons: ["Approve", "Decline", "Cancel Run"],
+    defaultId: 0,
+    cancelId: 2,
+    noLink: true,
+    title: "SnCode Approval",
+    message: "Codex app-server is requesting permission to apply file changes.",
+    detail: detailLines.join("\n"),
+  };
+  const res = win ? await dialog.showMessageBox(win, opts) : await dialog.showMessageBox(opts);
+
+  if (res.response === 0) return "accept" as const;
+  if (res.response === 1) return "decline" as const;
+  return "cancel" as const;
+}
+
+interface ThreadRunUiBridge {
+  onStatus: (detail: string) => void;
+  onChunk: (chunk: string) => void;
+  onToolStart: (name: string, detail: string, args?: Record<string, unknown>) => string;
+  onToolEnd: (pendingId: string, name: string, detail: string, result: string, durationMs?: number) => void;
+  onText: (text: string, metadata?: Record<string, unknown>) => void;
+  onTaskProgress: (pendingId: string, trailEntry: SubAgentTrailEntry) => void;
+  onDone: () => void;
+  onCancelled: () => void;
+}
+
+function createThreadRunUiBridge(threadId: string): ThreadRunUiBridge {
+  function storeAndEmit(role: "assistant" | "tool", content: string, metadata?: Record<string, unknown>) {
+    store.appendMessage(threadId, role, content, metadata);
+    const msgs = store.getMessages(threadId);
+    const last = msgs[msgs.length - 1];
+    emit("agent:message", { threadId, message: last });
+    return last.id;
+  }
+
+  return {
+    onStatus: (detail) => emit("agent:status", { threadId, status: "running", detail }),
+    onChunk: (chunk) => emit("agent:chunk", { threadId, chunk }),
+    onToolStart: (name, detail, args) => {
+      const meta: Record<string, unknown> = { toolName: name, toolDetail: detail, pending: true };
+      if (name === "spawn_task" && args) {
+        meta.isTask = true;
+        meta.taskType = String(args.type || "general");
+        meta.taskDescription = String(args.description || detail);
+      }
+      return storeAndEmit("tool", "", meta);
+    },
+    onToolEnd: (pendingId, name, _detail, result, durationMs) => {
+      const meta: Record<string, unknown> = { pending: false };
+      if (name === "spawn_task" && durationMs !== undefined) meta.taskDurationMs = durationMs;
+      const updated = store.updateMessage(pendingId, { content: result, metadata: meta });
+      if (updated) emit("agent:message", { threadId, message: updated });
+    },
+    onText: (text, metadata) => {
+      storeAndEmit("assistant", text, metadata);
+    },
+    onTaskProgress: (pendingId, trailEntry) => {
+      const msgs = store.getMessages(threadId);
+      const msg = msgs.find((m) => m.id === pendingId);
+      if (!msg) return;
+      const existingTrail: SubAgentTrailEntry[] = msg.metadata?.taskTrail ?? [];
+      const newTrail: SubAgentTrailEntry[] = [...existingTrail, trailEntry];
+      const updated = store.updateMessage(pendingId, { metadata: { taskTrail: newTrail } });
+      if (updated) emit("agent:message", { threadId, message: updated });
+    },
+    onDone: () => emit("agent:status", { threadId, status: "idle", detail: "Done" }),
+    onCancelled: () => emit("agent:status", { threadId, status: "cancelled", detail: "Run cancelled" }),
+  };
+}
+
+interface UnifiedProviderRunInput {
+  threadId: string;
+  projectId: string;
+  projectRoot: string;
+  content: string;
+  images?: z.infer<typeof sendMessageInputSchema>["images"];
+  permissionMode: "full" | "approve";
+  abortSignal: AbortSignal;
+  ui: ThreadRunUiBridge;
+}
+
+interface UnifiedProviderRunOutcome {
+  status: "completed" | "interrupted";
+  codexThreadId?: string;
+}
+
+async function runUnifiedProviderTurn(input: UnifiedProviderRunInput): Promise<UnifiedProviderRunOutcome> {
+  const providers = store.getState().providers;
+  const activeProvider = providers.find((p) => p.enabled);
+  if (!activeProvider) throw new Error("No provider enabled. Configure Anthropic or Codex in settings.");
+
+  const projectSkillConfig = store.getProjectSkills(input.projectId);
+  const availableSkills = discoverSkills(input.projectRoot);
+
+  const enabledSkillContents: Array<{ name: string; content: string }> = [];
+  for (const skillId of projectSkillConfig.enabledSkillIds) {
+    const sc = loadSkillContent(skillId, input.projectRoot);
+    if (sc) enabledSkillContents.push({ name: sc.skill.name, content: sc.content });
+  }
+  const enabledSkillRefs = availableSkills
+    .filter((s) => projectSkillConfig.enabledSkillIds.includes(s.id))
+    .map((s) => ({ name: s.name, filePath: s.filePath }));
+
+  if (activeProvider.id === "codex") {
+    const credential = await getProviderCredential("codex");
+    if (!credential) throw new Error("codex is enabled but credential is not configured.");
+
+    const codexResult = await runCodexAppServerTurn({
+      provider: activeProvider,
+      credential,
+      projectRoot: input.projectRoot,
+      localThreadId: input.threadId,
+      localCodexThreadId: store.getThread(input.threadId)?.codexThreadId,
+      content: input.content.trim(),
+      images: input.images,
+      permissionMode: input.permissionMode,
+      settings: store.getSettings(),
+      abortSignal: input.abortSignal,
+      enabledSkills: enabledSkillRefs,
+      approvalPrompts: {
+        command: promptCodexCommandApproval,
+        fileChange: promptCodexFileChangeApproval,
+      },
+      callbacks: {
+        onChunk: input.ui.onChunk,
+        onText: input.ui.onText,
+        onToolStart: input.ui.onToolStart,
+        onToolEnd: input.ui.onToolEnd,
+        onStatus: input.ui.onStatus,
+      },
+    });
+
+    return { status: codexResult.status, codexThreadId: codexResult.codexThreadId };
+  }
+
+  const result = await runAgent({
+    providers,
+    history: store.getMessages(input.threadId),
+    projectRoot: input.projectRoot,
+    settings: store.getSettings(),
+    abortSignal: input.abortSignal,
+    getCredential: getProviderCredential,
+    enabledSkills: enabledSkillContents,
+    availableSkills: availableSkills.map((s) => ({ id: s.id, name: s.name, description: s.description })),
+    callbacks: {
+      onChunk: input.ui.onChunk,
+      onToolStart: input.ui.onToolStart,
+      onToolEnd: input.ui.onToolEnd,
+      onText: input.ui.onText,
+      onTaskProgress: input.ui.onTaskProgress,
+    },
+  });
+
+  input.ui.onText(result.text, { inputTokens: result.inputTokens, outputTokens: result.outputTokens });
+  return { status: "completed" };
+}
+
+async function sendMessageInternal(parsed: z.infer<typeof sendMessageInputSchema>) {
+  const thread = store.getThread(parsed.threadId);
+  if (!thread) throw new Error("Thread not found");
+  const project = store.getState().projects.find((item) => item.id === thread.projectId);
+  if (!project) throw new Error("Project not found");
+
+  const previousController = runControllers.get(parsed.threadId);
+  if (previousController) throw new Error("A run is already active for this thread");
+
+  store.appendMessage(parsed.threadId, "user", parsed.content, undefined, parsed.images);
+
+  const threadMsgs = store.getMessages(parsed.threadId);
+  const userMsgs = threadMsgs.filter((m) => m.role === "user");
+  if (userMsgs.length === 1) {
+    store.updateThread(parsed.threadId, { title: truncateTitle(parsed.content) });
+    void generateTitle(parsed.content, store.getState().providers).then((aiTitle) => {
+      store.updateThread(parsed.threadId, { title: aiTitle });
+    });
+  }
+
+  const immediateState = store.getState();
+  const controller = new AbortController();
+  runControllers.set(parsed.threadId, controller);
+  const ui = createThreadRunUiBridge(parsed.threadId);
+  ui.onStatus("Running agent");
+
+  void (async () => {
+    try {
+      const outcome = await runUnifiedProviderTurn({
+        threadId: parsed.threadId,
+        projectId: project.id,
+        projectRoot: project.folderPath,
+        content: parsed.content,
+        images: parsed.images,
+        permissionMode: parsed.permissionMode === "approve" ? "approve" : "full",
+        abortSignal: controller.signal,
+        ui,
+      });
+
+      if (outcome.codexThreadId && store.getThread(parsed.threadId)?.codexThreadId !== outcome.codexThreadId) {
+        store.updateThread(parsed.threadId, { codexThreadId: outcome.codexThreadId });
+      }
+      if (outcome.status === "interrupted") {
+        ui.onCancelled();
+        return;
+      }
+
+      ui.onDone();
+    } catch (error) {
+      let detail = error instanceof Error ? error.message : "Unknown error";
+      const anyErr = error as Record<string, unknown>;
+      if (anyErr?.status) detail = `HTTP ${anyErr.status}: ${detail}`;
+      if (anyErr?.error && typeof anyErr.error === "object") {
+        const apiErr = anyErr.error as Record<string, unknown>;
+        if (apiErr.message) detail += ` — ${apiErr.message}`;
+        if (apiErr.type) detail += ` (${apiErr.type})`;
+        if (apiErr.code) detail += ` [${apiErr.code}]`;
+      }
+      console.error("[Agent error]", error);
+      const status = detail.includes("Run cancelled") ? "cancelled" : "error";
+      ui.onText(`Agent failed: ${detail}`, { isError: true });
+      if (status === "cancelled") ui.onCancelled();
+      else emit("agent:status", { threadId: parsed.threadId, status, detail });
+    } finally {
+      runControllers.delete(parsed.threadId);
+    }
+  })();
+
+  return immediateState;
+}
+
 function registerIpc() {
   ipcMain.handle("state:get", () => store.getState());
 
@@ -224,6 +490,13 @@ function registerIpc() {
       authMode: parsed.authMode,
       model: parsed.model
     });
+  });
+
+  ipcMain.handle("provider:update-batch", (_event, payload: unknown) => {
+    const parsed = providerUpdateBatchInputSchema.parse(payload);
+    return store.updateProviders(
+      parsed.map((p) => ({ id: p.id, updates: { enabled: p.enabled, authMode: p.authMode, model: p.model } }))
+    );
   });
 
   ipcMain.handle("provider:credential:set", async (_event, payload: unknown) => {
@@ -532,153 +805,10 @@ function registerIpc() {
     return deleteSkill(String(skillId || ""));
   });
 
+
   ipcMain.handle("message:send", async (_event, payload: unknown) => {
     const parsed = sendMessageInputSchema.parse(payload);
-    const thread = store.getThread(parsed.threadId);
-    if (!thread) {
-      throw new Error("Thread not found");
-    }
-    const project = store.getState().projects.find((item) => item.id === thread.projectId);
-    if (!project) {
-      throw new Error("Project not found");
-    }
-
-    const previousController = runControllers.get(parsed.threadId);
-    if (previousController) {
-      throw new Error("A run is already active for this thread");
-    }
-
-    store.appendMessage(parsed.threadId, "user", parsed.content, undefined, parsed.images);
-
-    // Auto-generate thread title from first user message
-    const threadMsgs = store.getMessages(parsed.threadId);
-    const userMsgs = threadMsgs.filter((m) => m.role === "user");
-    if (userMsgs.length === 1) {
-      // Set a quick truncated title immediately so the UI updates fast
-      store.updateThread(parsed.threadId, { title: truncateTitle(parsed.content) });
-      // Fire-and-forget AI title generation — update when ready
-      void generateTitle(parsed.content, store.getState().providers).then((aiTitle) => {
-        store.updateThread(parsed.threadId, { title: aiTitle });
-      });
-    }
-
-    // Return state immediately so the user message appears in the UI right away.
-    // The agent runs in the background — the renderer listens to agent events for streaming.
-    const immediateState = store.getState();
-
-    const controller = new AbortController();
-    runControllers.set(parsed.threadId, controller);
-    emit("agent:status", {
-      threadId: parsed.threadId,
-      status: "running",
-      detail: "Running agent"
-    });
-
-    /** Store a message and emit it to the renderer in real-time */
-    function storeAndEmit(
-      role: "assistant" | "tool",
-      content: string,
-      metadata?: Record<string, unknown>
-    ) {
-      store.appendMessage(parsed.threadId, role, content, metadata);
-      const msgs = store.getMessages(parsed.threadId);
-      const last = msgs[msgs.length - 1];
-      emit("agent:message", { threadId: parsed.threadId, message: last });
-      return last.id;
-    }
-
-    // Gather enabled skill contents for the agent
-    const projectSkillConfig = store.getProjectSkills(project.id);
-    const enabledSkillContents: Array<{ name: string; content: string }> = [];
-    for (const skillId of projectSkillConfig.enabledSkillIds) {
-      const sc = loadSkillContent(skillId, project.folderPath);
-      if (sc) enabledSkillContents.push({ name: sc.skill.name, content: sc.content });
-    }
-
-    // Gather all available skills for the load_skill tool
-    const availableSkills = discoverSkills(project.folderPath);
-
-    // Fire-and-forget: run the agent in the background
-    void (async () => {
-      try {
-        const result = await runAgent({
-          providers: store.getState().providers,
-          history: store.getMessages(parsed.threadId),
-          projectRoot: project.folderPath,
-          settings: store.getSettings(),
-          abortSignal: controller.signal,
-          getCredential: getProviderCredential,
-          enabledSkills: enabledSkillContents,
-          availableSkills: availableSkills.map((s) => ({ id: s.id, name: s.name, description: s.description })),
-          callbacks: {
-            onChunk: (chunk) => {
-              emit("agent:chunk", { threadId: parsed.threadId, chunk });
-            },
-            onToolStart: (name, detail, args) => {
-              // Store a pending tool message so the card appears in the UI immediately
-              const meta: Record<string, unknown> = { toolName: name, toolDetail: detail, pending: true };
-              // Attach task-specific metadata for spawn_task
-              if (name === "spawn_task" && args) {
-                meta.isTask = true;
-                meta.taskType = String(args.type || "general");
-                meta.taskDescription = String(args.description || detail);
-              }
-              return storeAndEmit("tool", "", meta);
-            },
-            onToolEnd: (pendingId, name, _detail, result, durationMs) => {
-              // Update the pending message with the actual result
-              const meta: Record<string, unknown> = { pending: false };
-              if (name === "spawn_task" && durationMs !== undefined) {
-                meta.taskDurationMs = durationMs;
-              }
-              const updated = store.updateMessage(pendingId, { content: result, metadata: meta });
-              if (updated) {
-                emit("agent:message", { threadId: parsed.threadId, message: updated });
-              }
-            },
-            onText: (text, metadata) => {
-              storeAndEmit("assistant", text, metadata);
-            },
-            onTaskProgress: (pendingId, trailEntry) => {
-              // Update the pending task message with trail entry
-              const msgs = store.getMessages(parsed.threadId);
-              const msg = msgs.find((m) => m.id === pendingId);
-              if (msg) {
-                const existingTrail: SubAgentTrailEntry[] = msg.metadata?.taskTrail ?? [];
-                const newTrail: SubAgentTrailEntry[] = [...existingTrail, trailEntry];
-                const updated = store.updateMessage(pendingId, { metadata: { taskTrail: newTrail } });
-                if (updated) {
-                  emit("agent:message", { threadId: parsed.threadId, message: updated });
-                }
-              }
-            }
-          }
-        });
-
-        storeAndEmit("assistant", result.text, {
-          inputTokens: result.inputTokens,
-          outputTokens: result.outputTokens,
-        });
-        emit("agent:status", {
-          threadId: parsed.threadId,
-          status: "idle",
-          detail: "Done"
-        });
-      } catch (error) {
-        const detail = error instanceof Error ? error.message : "Unknown error";
-        const status = detail === "Run cancelled" ? "cancelled" : "error";
-        storeAndEmit("assistant", `Agent failed: ${detail}`, { isError: true });
-        emit("agent:status", {
-          threadId: parsed.threadId,
-          status,
-          detail
-        });
-      } finally {
-        runControllers.delete(parsed.threadId);
-      }
-    })();
-
-    return immediateState;
+    return sendMessageInternal(parsed);
   });
 }
 
