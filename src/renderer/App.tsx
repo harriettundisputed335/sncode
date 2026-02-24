@@ -223,6 +223,7 @@ const ToolMessage = React.memo(function ToolMessage({ msg }: { msg: ThreadMessag
   const [expanded, setExpanded] = useState(false);
   const name = msg.metadata?.toolName || "tool";
   const detail = msg.metadata?.toolDetail || name;
+  const detailDisplay = useMemo(() => formatToolDetailForDisplay(name, detail), [name, detail]);
   const pending = msg.metadata?.pending === true;
   const result = msg.content;
   const previewChars = name === "run_command" ? 120 : 200;
@@ -268,10 +269,16 @@ const ToolMessage = React.memo(function ToolMessage({ msg }: { msg: ThreadMessag
       <button
         onClick={() => !pending && setExpanded((v) => !v)}
         className="flex w-full items-center gap-2 px-3.5 py-2 text-left"
+        title={detail}
       >
         <div className={`h-1.5 w-1.5 shrink-0 rounded-full ${dotColor}`} />
-        <span className="min-w-0 flex-1 truncate text-[12px] text-[var(--text-muted)]">
-          {pending ? `${detail}...` : detail}
+        <span className="shrink-0 rounded border border-[var(--border)] bg-[var(--bg-surface)] px-1.5 py-px text-[9px] font-medium uppercase tracking-wide text-[var(--text-dimmer)]">
+          {name.replaceAll("_", " ")}
+        </span>
+        <span
+          className={`min-w-0 flex-1 truncate text-[12px] ${detailDisplay.mono ? "font-mono text-[var(--text-label)]" : "text-[var(--text-muted)]"}`}
+        >
+          {pending ? `${detailDisplay.text}...` : detailDisplay.text}
         </span>
         {!pending && (
           <svg
@@ -315,10 +322,14 @@ const TaskMessage = React.memo(function TaskMessage({ msg, onClickDetail }: { ms
   const [expanded, setExpanded] = useState(false);
   const pending = msg.metadata?.pending === true;
   const taskType = msg.metadata?.taskType || "general";
-  const description = msg.metadata?.taskDescription || msg.metadata?.toolDetail || "Task";
+  const rawDescription = msg.metadata?.taskDescription || msg.metadata?.toolDetail || "Task";
+  const description = msg.metadata?.taskDescription
+    ? rawDescription
+    : formatToolDetailForDisplay("spawn_task", rawDescription).text;
   const duration = msg.metadata?.taskDurationMs;
   const trail = msg.metadata?.taskTrail || [];
   const lastTrail = trail.length > 0 ? trail[trail.length - 1] : null;
+  const lastTrailDisplay = lastTrail ? formatTrailSummary(lastTrail.summary) : null;
   const result = msg.content;
   const isLong = result.length > 300;
   const [renderExpandedMarkdown, setRenderExpandedMarkdown] = useState(false);
@@ -371,7 +382,7 @@ const TaskMessage = React.memo(function TaskMessage({ msg, onClickDetail }: { ms
         <div className="mx-4 border-t border-[var(--border-subtle)] py-1.5">
           <div className="flex items-center gap-1.5 text-[10px] text-[var(--text-dim)]">
             <div className={`h-1 w-1 rounded-full ${lastTrail.type === "tool" ? "bg-blue-400/70" : "bg-[var(--text-dim)]"}`} />
-            <span className="truncate">{lastTrail.summary}</span>
+            <span className={`truncate ${lastTrailDisplay?.mono ? "font-mono text-[var(--text-muted)]" : ""}`}>{lastTrailDisplay?.text ?? lastTrail.summary}</span>
           </div>
         </div>
       )}
@@ -435,10 +446,72 @@ function formatMessageClock(iso: string): string {
   return new Date(iso).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
 }
 
-const rowPerfStyle: React.CSSProperties = {
-  contentVisibility: "auto",
-  containIntrinsicSize: "160px",
-};
+function stripOuterQuotes(value: string): string {
+  const s = value.trim();
+  if (s.length < 2) return s;
+  const first = s[0];
+  const last = s[s.length - 1];
+  if ((first === "\"" && last === "\"") || (first === "'" && last === "'")) {
+    return s.slice(1, -1);
+  }
+  return s;
+}
+
+function unwrapShellWrapper(command: string): string {
+  let current = command.trim();
+  const patterns: RegExp[] = [
+    /^\s*(?:"[^"]*\\)?(?:pwsh|powershell)(?:\.exe)?"?\s+(?:-[A-Za-z]+\s+)*-Command\s+([\s\S]+)$/i,
+    /^\s*(?:"[^"]*\\)?cmd(?:\.exe)?"?\s+\/[dDsS]\s+\/[sS]\s+\/[cC]\s+([\s\S]+)$/i,
+    /^\s*(?:"[^"]*\\)?cmd(?:\.exe)?"?\s+\/[cC]\s+([\s\S]+)$/i,
+    /^\s*(?:\/bin\/)?(?:bash|sh|zsh)\s+-lc\s+([\s\S]+)$/i,
+  ];
+
+  for (let i = 0; i < 3; i++) {
+    const next = stripOuterQuotes(current);
+    let matched = false;
+    for (const pattern of patterns) {
+      const m = next.match(pattern);
+      if (m?.[1]) {
+        current = stripOuterQuotes(m[1]);
+        matched = true;
+        break;
+      }
+    }
+    if (!matched) {
+      current = next;
+      break;
+    }
+  }
+  return current;
+}
+
+function formatToolDetailForDisplay(toolName: string, detail: string): { text: string; mono: boolean } {
+  const raw = detail.trim();
+  if (!raw) return { text: toolName, mono: false };
+
+  if (toolName === "run_command") {
+    const withoutPrefix = raw.replace(/^Running:\s*/i, "");
+    return { text: unwrapShellWrapper(withoutPrefix), mono: true };
+  }
+
+  if (toolName === "spawn_task") {
+    return { text: raw.replace(/^Task:\s*/i, ""), mono: false };
+  }
+
+  return { text: raw, mono: false };
+}
+
+function formatTrailSummary(summary: string): { text: string; mono: boolean } {
+  const raw = summary.trim();
+  if (!raw) return { text: summary, mono: false };
+  if (/^Running:\s*/i.test(raw)) {
+    return { text: unwrapShellWrapper(raw.replace(/^Running:\s*/i, "")), mono: true };
+  }
+  return { text: raw, mono: false };
+}
+
+// Avoid content-visibility here: it caused visible text jitter/flicker while scrolling.
+const rowPerfStyle: React.CSSProperties | undefined = undefined;
 
 const ChatMessageRow = React.memo(function ChatMessageRow({
   msg,
@@ -453,6 +526,14 @@ const ChatMessageRow = React.memo(function ChatMessageRow({
   const isTool = msg.role === "tool";
   const isError = msg.metadata?.isError;
   const timestamp = useMemo(() => formatMessageClock(msg.createdAt), [msg.createdAt]);
+  const [copied, setCopied] = useState(false);
+  const copyResetRef = useRef<number | null>(null);
+
+  useEffect(() => {
+    return () => {
+      if (copyResetRef.current !== null) window.clearTimeout(copyResetRef.current);
+    };
+  }, []);
 
   if (isTool && msg.metadata?.isTask) {
     return (
@@ -471,9 +552,43 @@ const ChatMessageRow = React.memo(function ChatMessageRow({
   }
 
   if (isUser) {
+    const canCopy = msg.content.trim().length > 0;
+    const onCopy = async () => {
+      if (!canCopy) return;
+      try {
+        await navigator.clipboard.writeText(msg.content);
+        setCopied(true);
+        if (copyResetRef.current !== null) window.clearTimeout(copyResetRef.current);
+        copyResetRef.current = window.setTimeout(() => setCopied(false), 1200);
+      } catch {
+        // Best effort only; avoid noisy UI for clipboard failures.
+      }
+    };
     return (
       <div id={`msg-${msg.id}`} style={rowPerfStyle} className="flex justify-end">
-        <div className="max-w-[80%]">
+        <div className="group/message max-w-[80%]">
+          {canCopy && (
+            <div className="mb-1 flex justify-end">
+              <button
+                type="button"
+                onClick={(e) => { e.stopPropagation(); void onCopy(); }}
+                className={`grid h-7 w-7 place-items-center rounded-md border border-[var(--border)] bg-[var(--bg-elevated)] text-[var(--text-dimmer)] shadow-sm transition hover:bg-[var(--bg-card)] hover:text-[var(--text-muted)] focus:opacity-100 ${copied ? "opacity-100 text-emerald-400" : "opacity-0 group-hover/message:opacity-100"}`}
+                title={copied ? "Copied" : "Copy message"}
+                aria-label={copied ? "Copied" : "Copy message"}
+              >
+                {copied ? (
+                  <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
+                    <path d="M20 6 9 17l-5-5" />
+                  </svg>
+                ) : (
+                  <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                    <rect x="9" y="9" width="13" height="13" rx="2" ry="2" />
+                    <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1" />
+                  </svg>
+                )}
+              </button>
+            </div>
+          )}
           <div className="rounded-2xl rounded-br-sm bg-[var(--bg-user-bubble)] px-4 py-2.5">
             {msg.images && msg.images.length > 0 && (
               <div className="mb-2 flex flex-wrap gap-2">
@@ -550,7 +665,8 @@ function findStartIndex(offsets: number[], targetTop: number): number {
     if (offsets[mid] < targetTop) lo = mid + 1;
     else hi = mid - 1;
   }
-  return Math.max(0, Math.min(offsets.length - 1, lo));
+  // We need the row containing targetTop (largest offset <= targetTop), not the first offset >= targetTop.
+  return Math.max(0, Math.min(offsets.length - 1, lo - 1));
 }
 
 const MeasuredVirtualRow = React.memo(function MeasuredVirtualRow({
@@ -1340,7 +1456,10 @@ function RightSidebarDiffView({ diffs, onClose }: { diffs: GitDiffEntry[]; onClo
 function RightSidebarSubAgent({ msg, onClose }: { msg: ThreadMessage; onClose: () => void }) {
   const pending = msg.metadata?.pending === true;
   const taskType = msg.metadata?.taskType || "general";
-  const description = msg.metadata?.taskDescription || msg.metadata?.toolDetail || "Task";
+  const rawDescription = msg.metadata?.taskDescription || msg.metadata?.toolDetail || "Task";
+  const description = msg.metadata?.taskDescription
+    ? rawDescription
+    : formatToolDetailForDisplay("spawn_task", rawDescription).text;
   const duration = msg.metadata?.taskDurationMs;
   const trail = msg.metadata?.taskTrail || [];
   const result = msg.content;
@@ -1387,7 +1506,14 @@ function RightSidebarSubAgent({ msg, onClose }: { msg: ThreadMessage; onClose: (
                   {i < trail.length - 1 && <div className="mt-0.5 h-3 w-px bg-[var(--border-subtle)]" />}
                 </div>
                 <div className="min-w-0 flex-1">
-                  <span className="text-[11px] text-[var(--text-secondary)] break-all">{entry.summary}</span>
+                  {(() => {
+                    const trailDisplay = formatTrailSummary(entry.summary);
+                    return (
+                      <span className={`text-[11px] break-all ${trailDisplay.mono ? "font-mono text-[var(--text-label)]" : "text-[var(--text-secondary)]"}`}>
+                        {trailDisplay.text}
+                      </span>
+                    );
+                  })()}
                 </div>
                 <span className="shrink-0 text-[9px] text-[var(--text-dimmest)] mt-0.5">{new Date(entry.timestamp).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" })}</span>
               </div>
