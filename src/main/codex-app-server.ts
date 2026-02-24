@@ -93,7 +93,10 @@ class CodexAppServerClient {
       this.closed = true;
       this.rl.close();
       for (const fn of this.closedListeners) fn(why);
-      const err = new Error(`codex app-server closed (${why})${this.stderrTail.length ? `\n${this.stderrTail.slice(-8).join("\n")}` : ""}`);
+      const notFoundHint = why.includes("ENOENT") && why.toLowerCase().includes("codex")
+        ? "\nCodex CLI was not found. Install it and ensure `codex --version` works in your terminal, then restart SnCode."
+        : "";
+      const err = new Error(`codex app-server closed (${why})${notFoundHint}${this.stderrTail.length ? `\n${this.stderrTail.slice(-8).join("\n")}` : ""}`);
       for (const [, pending] of this.pending) pending.reject(err);
       this.pending.clear();
     };
@@ -104,7 +107,7 @@ class CodexAppServerClient {
   static async start(): Promise<CodexAppServerClient> {
     let proc: ChildProcessWithoutNullStreams;
     try {
-      proc = spawn("codex", ["app-server"], { stdio: ["pipe", "pipe", "pipe"] });
+      proc = spawnCodexAppServer();
     } catch (err) {
       throw new Error(`Failed to start codex app-server: ${err instanceof Error ? err.message : String(err)}`);
     }
@@ -171,6 +174,10 @@ class CodexAppServerClient {
     this.pending.clear();
   }
 
+  get isClosed() {
+    return this.closed;
+  }
+
   private write(msg: JsonRpcMessage) {
     this.proc.stdin.write(`${JSON.stringify(msg)}\n`);
   }
@@ -204,6 +211,47 @@ class CodexAppServerClient {
       for (const fn of this.notifications) fn(msg.method, msg.params);
     }
   }
+}
+
+function spawnCodexAppServer(): ChildProcessWithoutNullStreams {
+  if (process.platform === "win32") {
+    // npm/pnpm global CLIs are usually `.cmd` wrappers; launch via cmd.exe for compatibility.
+    return spawn("cmd.exe", ["/d", "/s", "/c", "codex app-server"], {
+      stdio: ["pipe", "pipe", "pipe"],
+      windowsHide: true,
+    });
+  }
+  return spawn("codex", ["app-server"], {
+    stdio: ["pipe", "pipe", "pipe"],
+  });
+}
+
+let sharedCodexClient: CodexAppServerClient | null = null;
+let sharedCodexClientStart: Promise<CodexAppServerClient> | null = null;
+
+async function getSharedCodexAppServerClient(): Promise<{ client: CodexAppServerClient; reused: boolean }> {
+  if (sharedCodexClient && !sharedCodexClient.isClosed) {
+    return { client: sharedCodexClient, reused: true };
+  }
+  if (sharedCodexClientStart) {
+    const client = await sharedCodexClientStart;
+    return { client, reused: true };
+  }
+
+  sharedCodexClientStart = CodexAppServerClient.start()
+    .then((client) => {
+      sharedCodexClient = client;
+      client.onClosed(() => {
+        if (sharedCodexClient === client) sharedCodexClient = null;
+      });
+      return client;
+    })
+    .finally(() => {
+      sharedCodexClientStart = null;
+    });
+
+  const client = await sharedCodexClientStart;
+  return { client, reused: false };
 }
 
 function mapThinkingEffort(level: AgentSettings["thinkingLevel"]): string | null {
@@ -362,7 +410,7 @@ async function refreshAuthTokensForServer(credential: string): Promise<{ accessT
 }
 
 export async function runCodexAppServerTurn(input: CodexRunInput): Promise<CodexRunResult> {
-  const client = await CodexAppServerClient.start();
+  const { client, reused } = await getSharedCodexAppServerClient();
   const tempImagePaths = writeTempImages(input.localThreadId, input.images);
   const toolMessageMap = new Map<string, { localId: string; name: string; detail: string; startedAt: number }>();
 
@@ -373,7 +421,7 @@ export async function runCodexAppServerTurn(input: CodexRunInput): Promise<Codex
   let abortTriggered = false;
 
   const cleanup = () => {
-    client.close();
+    // Intentionally keep the app-server process alive across turns.
   };
 
   client.setServerRequestHandler(async ({ id, method, params }) => {
@@ -527,7 +575,7 @@ export async function runCodexAppServerTurn(input: CodexRunInput): Promise<Codex
   input.abortSignal?.addEventListener("abort", onAbort, { once: true });
 
   try {
-    input.callbacks.onStatus("Starting Codex app-server");
+    input.callbacks.onStatus(reused ? "Using Codex app-server" : "Starting Codex app-server");
     await authenticateCodex(client, input.credential);
 
     const threadArgsBase = {
