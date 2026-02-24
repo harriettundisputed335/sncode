@@ -1,4 +1,4 @@
-import React, { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import React, { FormEvent, startTransition, useCallback, useDeferredValue, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import hljs from "highlight.js/lib/core";
@@ -67,6 +67,14 @@ const emptyState: AppState = {
 };
 
 type PermissionMode = "full" | "approve";
+type RightSidebarState = {
+  type: "file" | "diff" | "subagent";
+  filePath?: string;
+  fileContent?: string;
+  diffs?: GitDiffEntry[];
+  taskMsgId?: string;
+};
+type ThreadMessageMetaMap = Map<string, { count: number; last?: ThreadMessage }>;
 
 /* ── helpers ── */
 
@@ -143,7 +151,7 @@ function highlightChildren(children: React.ReactNode, query: string): React.Reac
   });
 }
 
-function Markdown({ content, searchHighlight }: { content: string; searchHighlight?: string }) {
+const Markdown = React.memo(function Markdown({ content, searchHighlight }: { content: string; searchHighlight?: string }) {
   const q = searchHighlight?.trim() || "";
   const wrap = (children: React.ReactNode) => (q ? highlightChildren(children, q) : children);
   return (
@@ -207,17 +215,43 @@ function Markdown({ content, searchHighlight }: { content: string; searchHighlig
       {content}
     </ReactMarkdown>
   );
-}
+});
 
 /* ── Tool message component ── */
 
-function ToolMessage({ msg }: { msg: ThreadMessage }) {
+const ToolMessage = React.memo(function ToolMessage({ msg }: { msg: ThreadMessage }) {
   const [expanded, setExpanded] = useState(false);
   const name = msg.metadata?.toolName || "tool";
   const detail = msg.metadata?.toolDetail || name;
   const pending = msg.metadata?.pending === true;
   const result = msg.content;
-  const isLong = result.length > 200;
+  const previewChars = name === "run_command" ? 120 : 200;
+  const isLong = result.length > previewChars;
+  const isHeavyOutput = name === "run_command" && result.length > 6000;
+  const [renderExpandedContent, setRenderExpandedContent] = useState(false);
+
+  useEffect(() => {
+    if (!expanded || !result) {
+      setRenderExpandedContent(false);
+      return;
+    }
+    if (!isHeavyOutput) {
+      setRenderExpandedContent(true);
+      return;
+    }
+    let cancelled = false;
+    const idle = (window as Window & { requestIdleCallback?: (cb: () => void) => number }).requestIdleCallback;
+    if (typeof idle === "function") {
+      const id = idle(() => { if (!cancelled) setRenderExpandedContent(true); });
+      return () => {
+        cancelled = true;
+        const cancelIdle = (window as Window & { cancelIdleCallback?: (id: number) => void }).cancelIdleCallback;
+        if (typeof cancelIdle === "function") cancelIdle(id);
+      };
+    }
+    const timer = window.setTimeout(() => { if (!cancelled) setRenderExpandedContent(true); }, 0);
+    return () => { cancelled = true; window.clearTimeout(timer); };
+  }, [expanded, isHeavyOutput, result]);
 
   const dotColor = pending
     ? "bg-amber-400/80 animate-pulse"
@@ -255,16 +289,18 @@ function ToolMessage({ msg }: { msg: ThreadMessage }) {
               <svg width="11" height="11" viewBox="0 0 12 12" fill="none"><path d="M2.5 6l2.5 2.5 4.5-5" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" strokeLinejoin="round" /></svg>
               {result}
             </div>
+          ) : expanded && isHeavyOutput && !renderExpandedContent ? (
+            <div className="py-1 text-[11px] text-[var(--text-dimmer)]">Rendering output…</div>
           ) : (
             <pre className="max-h-[300px] overflow-auto whitespace-pre-wrap font-mono text-[11px] leading-relaxed text-[var(--text-dim)]">
-              {isLong && !expanded ? result.slice(0, 200) + "..." : result}
+              {isLong && !expanded ? result.slice(0, previewChars) + "..." : result}
             </pre>
           )}
         </div>
       )}
     </div>
   );
-}
+});
 
 /* ── Task message component ── */
 
@@ -275,7 +311,7 @@ function formatDuration(ms: number): string {
   return `${Math.floor(s / 60)}m ${s % 60}s`;
 }
 
-function TaskMessage({ msg, onClickDetail }: { msg: ThreadMessage; onClickDetail?: (msg: ThreadMessage) => void }) {
+const TaskMessage = React.memo(function TaskMessage({ msg, onClickDetail }: { msg: ThreadMessage; onClickDetail?: (msg: ThreadMessage) => void }) {
   const [expanded, setExpanded] = useState(false);
   const pending = msg.metadata?.pending === true;
   const taskType = msg.metadata?.taskType || "general";
@@ -285,6 +321,17 @@ function TaskMessage({ msg, onClickDetail }: { msg: ThreadMessage; onClickDetail
   const lastTrail = trail.length > 0 ? trail[trail.length - 1] : null;
   const result = msg.content;
   const isLong = result.length > 300;
+  const [renderExpandedMarkdown, setRenderExpandedMarkdown] = useState(false);
+
+  useEffect(() => {
+    if (!expanded || !isLong) {
+      setRenderExpandedMarkdown(false);
+      return;
+    }
+    let cancelled = false;
+    const timer = window.setTimeout(() => { if (!cancelled) setRenderExpandedMarkdown(true); }, 0);
+    return () => { cancelled = true; window.clearTimeout(timer); };
+  }, [expanded, isLong, result]);
 
   const typeBadge = taskType === "explore"
     ? { label: "explore", color: "text-cyan-400 border-cyan-400/30 bg-cyan-400/5" }
@@ -348,7 +395,11 @@ function TaskMessage({ msg, onClickDetail }: { msg: ThreadMessage; onClickDetail
               </>
             ) : (
               <div className="max-h-[400px] overflow-auto text-[12px] leading-relaxed text-[var(--text-muted)]">
-                <Markdown content={result} />
+                {isLong && !renderExpandedMarkdown ? (
+                  <div className="py-1 text-[11px] text-[var(--text-dimmer)]">Rendering result…</div>
+                ) : (
+                  <Markdown content={result} />
+                )}
               </div>
             )}
             {expanded && isLong && (
@@ -378,7 +429,338 @@ function TaskMessage({ msg, onClickDetail }: { msg: ThreadMessage; onClickDetail
       )}
     </div>
   );
+});
+
+function formatMessageClock(iso: string): string {
+  return new Date(iso).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
 }
+
+const rowPerfStyle: React.CSSProperties = {
+  contentVisibility: "auto",
+  containIntrinsicSize: "160px",
+};
+
+const ChatMessageRow = React.memo(function ChatMessageRow({
+  msg,
+  searchHighlight,
+  onOpenSubAgent,
+}: {
+  msg: ThreadMessage;
+  searchHighlight: string;
+  onOpenSubAgent: (msg: ThreadMessage) => void;
+}) {
+  const isUser = msg.role === "user";
+  const isTool = msg.role === "tool";
+  const isError = msg.metadata?.isError;
+  const timestamp = useMemo(() => formatMessageClock(msg.createdAt), [msg.createdAt]);
+
+  if (isTool && msg.metadata?.isTask) {
+    return (
+      <div id={`msg-${msg.id}`} style={rowPerfStyle}>
+        <TaskMessage msg={msg} onClickDetail={onOpenSubAgent} />
+      </div>
+    );
+  }
+
+  if (isTool) {
+    return (
+      <div id={`msg-${msg.id}`} style={rowPerfStyle}>
+        <ToolMessage msg={msg} />
+      </div>
+    );
+  }
+
+  if (isUser) {
+    return (
+      <div id={`msg-${msg.id}`} style={rowPerfStyle} className="flex justify-end">
+        <div className="max-w-[80%]">
+          <div className="rounded-2xl rounded-br-sm bg-[var(--bg-user-bubble)] px-4 py-2.5">
+            {msg.images && msg.images.length > 0 && (
+              <div className="mb-2 flex flex-wrap gap-2">
+                {msg.images.map((img, i) => (
+                  <img
+                    key={i}
+                    src={`data:${img.mediaType};base64,${img.data}`}
+                    alt={img.name || "Attachment"}
+                    className="max-h-[200px] max-w-full rounded-lg border border-[var(--border-active)] object-contain"
+                  />
+                ))}
+              </div>
+            )}
+            {msg.content && (
+              <pre className="whitespace-pre-wrap font-sans text-[13px] leading-relaxed text-[var(--text-bright)]">
+                {searchHighlight ? <HighlightText text={msg.content} query={searchHighlight} /> : msg.content}
+              </pre>
+            )}
+          </div>
+          <div className="mt-0.5 text-right text-[10px] text-[var(--text-dimmest)]">
+            {timestamp}
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div id={`msg-${msg.id}`} style={rowPerfStyle}>
+      <div className={`text-[13px] ${isError ? "text-red-400/90" : "text-[var(--text-secondary)]"}`}>
+        <Markdown content={msg.content} searchHighlight={searchHighlight} />
+      </div>
+      <div className="mt-0.5 flex items-center gap-2 text-[10px] text-[var(--text-dimmest)]">
+        <span>{timestamp}</span>
+        {(msg.metadata?.inputTokens || msg.metadata?.outputTokens) && (
+          <span className="text-[var(--text-dimmest)]" title={`Input: ${msg.metadata.inputTokens?.toLocaleString() ?? 0} | Output: ${msg.metadata.outputTokens?.toLocaleString() ?? 0}`}>
+            {((msg.metadata.inputTokens ?? 0) + (msg.metadata.outputTokens ?? 0)).toLocaleString()} tokens
+          </span>
+        )}
+      </div>
+    </div>
+  );
+}, (prev, next) => (
+  prev.msg === next.msg &&
+  prev.searchHighlight === next.searchHighlight &&
+  prev.onOpenSubAgent === next.onOpenSubAgent
+));
+
+const VIRTUALIZE_MIN_MESSAGES = 80;
+const VIRTUAL_OVERSCAN_PX = 800;
+const VIRTUAL_ROW_GAP = 16;
+
+function estimateMessageRowHeight(msg: ThreadMessage): number {
+  if (msg.role === "tool") {
+    if (msg.metadata?.isTask) {
+      const base = msg.metadata?.pending ? 72 : 120;
+      return Math.min(320, base + Math.ceil(msg.content.length / 220) * 18);
+    }
+    if (msg.metadata?.pending) return 44;
+    return Math.min(260, 48 + Math.ceil(msg.content.length / 180) * 16);
+  }
+  if (msg.role === "user") {
+    const imageRows = msg.images ? Math.ceil(msg.images.length / 3) : 0;
+    return Math.min(420, 54 + imageRows * 88 + Math.ceil(msg.content.length / 70) * 18);
+  }
+  return Math.min(600, 42 + Math.ceil(msg.content.length / 90) * 18);
+}
+
+function findStartIndex(offsets: number[], targetTop: number): number {
+  let lo = 0;
+  let hi = offsets.length - 1;
+  while (lo <= hi) {
+    const mid = (lo + hi) >> 1;
+    if (offsets[mid] < targetTop) lo = mid + 1;
+    else hi = mid - 1;
+  }
+  return Math.max(0, Math.min(offsets.length - 1, lo));
+}
+
+const MeasuredVirtualRow = React.memo(function MeasuredVirtualRow({
+  id,
+  top,
+  onHeight,
+  children,
+}: {
+  id: string;
+  top: number;
+  onHeight: (id: string, height: number) => void;
+  children: React.ReactNode;
+}) {
+  const rowRef = useRef<HTMLDivElement>(null);
+
+  useLayoutEffect(() => {
+    const el = rowRef.current;
+    if (!el) return;
+
+    const publish = () => {
+      const next = Math.ceil(el.getBoundingClientRect().height);
+      if (next > 0) onHeight(id, next);
+    };
+
+    publish();
+
+    if (typeof ResizeObserver !== "undefined") {
+      const ro = new ResizeObserver(() => publish());
+      ro.observe(el);
+      return () => ro.disconnect();
+    }
+
+    const timeout = window.setTimeout(publish, 0);
+    return () => window.clearTimeout(timeout);
+  }, [id, onHeight]);
+
+  return (
+    <div
+      ref={rowRef}
+      style={{ position: "absolute", top, left: 0, right: 0 }}
+    >
+      {children}
+    </div>
+  );
+});
+
+const VirtualizedChatMessages = React.memo(function VirtualizedChatMessages({
+  messages,
+  searchHighlight,
+  onOpenSubAgent,
+  scrollTop,
+  viewportHeight,
+}: {
+  messages: ThreadMessage[];
+  searchHighlight: string;
+  onOpenSubAgent: (msg: ThreadMessage) => void;
+  scrollTop: number;
+  viewportHeight: number;
+}) {
+  const [heightVersion, setHeightVersion] = useState(0);
+  const heightMapRef = useRef<Map<string, number>>(new Map());
+
+  useEffect(() => {
+    const validIds = new Set(messages.map((m) => m.id));
+    let changed = false;
+    for (const id of Array.from(heightMapRef.current.keys())) {
+      if (!validIds.has(id)) {
+        heightMapRef.current.delete(id);
+        changed = true;
+      }
+    }
+    if (changed) setHeightVersion((v) => v + 1);
+  }, [messages]);
+
+  const onHeight = useCallback((id: string, height: number) => {
+    const prev = heightMapRef.current.get(id);
+    if (prev === height) return;
+    heightMapRef.current.set(id, height);
+    startTransition(() => setHeightVersion((v) => v + 1));
+  }, []);
+
+  const layout = useMemo(() => {
+    void heightVersion;
+    const offsets = new Array<number>(messages.length);
+    let total = 0;
+    for (let i = 0; i < messages.length; i++) {
+      offsets[i] = total;
+      const msg = messages[i];
+      const measured = heightMapRef.current.get(msg.id);
+      const h = measured ?? estimateMessageRowHeight(msg);
+      total += h + VIRTUAL_ROW_GAP;
+    }
+    if (total > 0) total -= VIRTUAL_ROW_GAP;
+    return { offsets, totalHeight: total };
+  }, [messages, heightVersion]);
+
+  if (messages.length === 0) return null;
+  if (messages.length < VIRTUALIZE_MIN_MESSAGES || viewportHeight <= 0) {
+    return (
+      <div className="space-y-4">
+        {messages.map((msg) => (
+          <ChatMessageRow
+            key={msg.id}
+            msg={msg}
+            searchHighlight={searchHighlight}
+            onOpenSubAgent={onOpenSubAgent}
+          />
+        ))}
+      </div>
+    );
+  }
+
+  const startY = Math.max(0, scrollTop - VIRTUAL_OVERSCAN_PX);
+  const endY = scrollTop + viewportHeight + VIRTUAL_OVERSCAN_PX;
+  const startIdx = findStartIndex(layout.offsets, startY);
+
+  let endIdx = startIdx;
+  while (endIdx < messages.length - 1) {
+    const nextTop = layout.offsets[endIdx + 1];
+    if (nextTop > endY) break;
+    endIdx++;
+  }
+
+  const visible = messages.slice(startIdx, endIdx + 1);
+
+  return (
+    <div style={{ position: "relative", height: layout.totalHeight }}>
+      {visible.map((msg, visibleIdx) => {
+        const absoluteIdx = startIdx + visibleIdx;
+        return (
+          <MeasuredVirtualRow
+            key={msg.id}
+            id={msg.id}
+            top={layout.offsets[absoluteIdx]}
+            onHeight={onHeight}
+          >
+            <ChatMessageRow
+              msg={msg}
+              searchHighlight={searchHighlight}
+              onOpenSubAgent={onOpenSubAgent}
+            />
+          </MeasuredVirtualRow>
+        );
+      })}
+    </div>
+  );
+});
+
+const ChatMessagesPane = React.memo(function ChatMessagesPane({
+  messages,
+  streamChunk,
+  isBusy,
+  statusText,
+  searchHighlight,
+  onOpenSubAgent,
+  messagesEndRef,
+  scrollTop,
+  viewportHeight,
+}: {
+  messages: ThreadMessage[];
+  streamChunk: string;
+  isBusy: boolean;
+  statusText: string;
+  searchHighlight: string;
+  onOpenSubAgent: (msg: ThreadMessage) => void;
+  messagesEndRef: React.RefObject<HTMLDivElement | null>;
+  scrollTop: number;
+  viewportHeight: number;
+}) {
+  if (messages.length === 0 && !streamChunk) {
+    return (
+      <div className="mt-32 text-center">
+        <div className="mb-3 text-[22px] font-semibold text-[var(--text-heading)]">What are you building?</div>
+        <p className="text-[13px] text-[var(--text-dim)]">Ask anything about your project â€” or start with a suggestion.</p>
+      </div>
+    );
+  }
+
+  return (
+    <div className="space-y-4">
+      <VirtualizedChatMessages
+        messages={messages}
+        searchHighlight={searchHighlight}
+        onOpenSubAgent={onOpenSubAgent}
+        scrollTop={scrollTop}
+        viewportHeight={viewportHeight}
+      />
+
+      {streamChunk && (
+        <div className="text-[13px] text-[var(--text-secondary)]" style={rowPerfStyle}>
+          <Markdown content={streamChunk} />
+          <span className="inline-block animate-pulse text-[var(--text-dimmer)]">|</span>
+        </div>
+      )}
+
+      {isBusy && !streamChunk && (
+        <div className="flex items-center gap-2 py-1">
+          <div className="flex gap-[3px]">
+            <div className="h-1 w-1 animate-bounce rounded-full bg-[var(--text-dimmer)]" style={{ animationDelay: "0ms" }} />
+            <div className="h-1 w-1 animate-bounce rounded-full bg-[var(--text-dimmer)]" style={{ animationDelay: "150ms" }} />
+            <div className="h-1 w-1 animate-bounce rounded-full bg-[var(--text-dimmer)]" style={{ animationDelay: "300ms" }} />
+          </div>
+          <span className="text-[11px] text-[var(--text-dimmer)]">{statusText}</span>
+        </div>
+      )}
+
+      <div ref={messagesEndRef} />
+    </div>
+  );
+});
 
 /* ── icons ── */
 
@@ -1603,6 +1985,407 @@ function OnboardingModal({
   );
 }
 
+const RightSidebarPane = React.memo(function RightSidebarPane({
+  rightSidebar,
+  liveTaskMsg,
+  onClose,
+}: {
+  rightSidebar: RightSidebarState | null;
+  liveTaskMsg?: ThreadMessage;
+  onClose: () => void;
+}) {
+  if (!rightSidebar) return null;
+  const isSubagent = rightSidebar.type === "subagent";
+  return (
+    <div className={`flex min-w-0 flex-col ${isSubagent ? "w-[40vw] max-w-[560px] min-w-[320px]" : "w-[30vw] max-w-[420px] min-w-[280px]"}`}>
+      <div className="m-2 ml-0 flex flex-1 flex-col overflow-hidden rounded-2xl border border-[var(--border)] bg-[var(--bg-card)] shadow-lg">
+        {rightSidebar.type === "file" && rightSidebar.filePath && (
+          <RightSidebarFileView
+            filePath={rightSidebar.filePath}
+            content={rightSidebar.fileContent || ""}
+            onClose={onClose}
+          />
+        )}
+        {rightSidebar.type === "diff" && (
+          <RightSidebarDiffView
+            diffs={rightSidebar.diffs || []}
+            onClose={onClose}
+          />
+        )}
+        {isSubagent && liveTaskMsg && (
+          <RightSidebarSubAgent
+            msg={liveTaskMsg}
+            onClose={onClose}
+          />
+        )}
+      </div>
+    </div>
+  );
+}, (prev, next) => prev.rightSidebar === next.rightSidebar && prev.liveTaskMsg === next.liveTaskMsg);
+
+const ComposerPanel = React.memo(function ComposerPanel({
+  todos,
+  onToggleTodo,
+  onRemoveTodo,
+  onAddTodo,
+  onSend,
+  dragOver,
+  setDragOver,
+  addImages,
+  pendingImages,
+  removeImage,
+  msgInput,
+  setMsgInput,
+  fileInputRef,
+  providers,
+  showModelPicker,
+  setShowModelPicker,
+  pickModel,
+  permission,
+  setPermission,
+  thinkingLevel,
+  thinkingProvider,
+  updateThinkingLevel,
+  isBusy,
+  onCancel,
+  selThreadId,
+}: {
+  todos: TodoItem[];
+  onToggleTodo: (id: string) => void;
+  onRemoveTodo: (id: string) => void;
+  onAddTodo: (content: string) => void;
+  onSend: (e: FormEvent) => Promise<void>;
+  dragOver: boolean;
+  setDragOver: React.Dispatch<React.SetStateAction<boolean>>;
+  addImages: (files: FileList | File[]) => Promise<void>;
+  pendingImages: ImageAttachment[];
+  removeImage: (idx: number) => void;
+  msgInput: string;
+  setMsgInput: React.Dispatch<React.SetStateAction<string>>;
+  fileInputRef: React.RefObject<HTMLInputElement | null>;
+  providers: ProviderConfig[];
+  showModelPicker: boolean;
+  setShowModelPicker: React.Dispatch<React.SetStateAction<boolean>>;
+  pickModel: (modelId: string) => Promise<void>;
+  permission: PermissionMode;
+  setPermission: React.Dispatch<React.SetStateAction<PermissionMode>>;
+  thinkingLevel: ThinkingLevel;
+  thinkingProvider: ProviderId;
+  updateThinkingLevel: (level: ThinkingLevel) => void;
+  isBusy: boolean;
+  onCancel: () => Promise<void>;
+  selThreadId: string | null;
+}) {
+  const available = useMemo(() => availableModels(providers), [providers]);
+  const activeLabel = useMemo(() => activeModelLabel(providers), [providers]);
+  const activeId = useMemo(() => activeModelId(providers), [providers]);
+
+  return (
+    <div className="shrink-0 px-4 pb-4 pt-1">
+      <div className="mx-auto max-w-[820px]">
+        <TodoPanel todos={todos} onToggle={onToggleTodo} onRemove={onRemoveTodo} onAdd={onAddTodo} />
+      </div>
+      <form onSubmit={onSend} className="mx-auto max-w-[820px]">
+        <div
+          className={`rounded-xl border bg-[var(--bg-elevated)] transition-colors focus-within:border-[var(--border-active)] ${dragOver ? "border-blue-500/50 bg-[var(--bg-drag-highlight)]" : "border-[var(--border)]"}`}
+          onDragOver={(e) => { e.preventDefault(); setDragOver(true); }}
+          onDragLeave={() => setDragOver(false)}
+          onDrop={async (e) => {
+            e.preventDefault();
+            setDragOver(false);
+            if (e.dataTransfer.files.length > 0) {
+              await addImages(e.dataTransfer.files);
+            }
+          }}
+        >
+          {pendingImages.length > 0 && (
+            <div className="flex flex-wrap gap-2 px-3.5 pt-2.5">
+              {pendingImages.map((img, i) => (
+                <div key={i} className="group relative">
+                  <img
+                    src={`data:${img.mediaType};base64,${img.data}`}
+                    alt={img.name || "Attachment"}
+                    className="h-16 w-16 rounded-lg border border-[var(--border-active)] object-cover"
+                  />
+                  <button
+                    type="button"
+                    onClick={() => removeImage(i)}
+                    className="absolute -right-1.5 -top-1.5 hidden h-4 w-4 items-center justify-center rounded-full bg-[var(--bg-stop)] text-[var(--text-muted)] transition hover:bg-red-500 hover:text-white group-hover:flex"
+                  >
+                    <XIcon />
+                  </button>
+                  {img.name && (
+                    <div className="absolute inset-x-0 bottom-0 truncate rounded-b-lg bg-black/60 px-1 py-0.5 text-[9px] text-[var(--text-muted)]">{img.name}</div>
+                  )}
+                </div>
+              ))}
+            </div>
+          )}
+
+          <textarea
+            value={msgInput}
+            onChange={(e) => setMsgInput(e.target.value)}
+            onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); void onSend(e); } }}
+            onPaste={async (e) => {
+              const items = e.clipboardData.items;
+              const imageFiles: File[] = [];
+              for (let i = 0; i < items.length; i++) {
+                const item = items[i];
+                if (item.type.startsWith("image/")) {
+                  const file = item.getAsFile();
+                  if (file) imageFiles.push(file);
+                }
+              }
+              if (imageFiles.length > 0) {
+                e.preventDefault();
+                await addImages(imageFiles);
+              }
+            }}
+            placeholder={pendingImages.length > 0 ? "Add a message or just send the image..." : "Type your message here..."}
+            rows={2}
+            className="w-full resize-none bg-transparent px-4 pb-1.5 pt-3 text-[13px] leading-relaxed text-[var(--text-primary)] outline-none placeholder:text-[var(--text-dimmest)]"
+          />
+          <input
+            ref={fileInputRef}
+            type="file"
+            accept="image/jpeg,image/png,image/gif,image/webp"
+            multiple
+            className="hidden"
+            onChange={(e) => {
+              if (e.target.files) void addImages(e.target.files);
+              e.target.value = "";
+            }}
+          />
+          <div className="flex items-center px-3 pb-2.5">
+            <button type="button" onClick={() => fileInputRef.current?.click()} className="grid h-7 w-7 place-items-center rounded-md text-[var(--text-dim)] transition hover:bg-[var(--bg-active)] hover:text-[var(--text-muted)]" title="Attach image">
+              <PaperclipIcon />
+            </button>
+            <div className="mx-1 h-3.5 w-px bg-[var(--bg-active)]" />
+            <div className="relative">
+              <button type="button" onClick={() => setShowModelPicker((v) => !v)} className="flex items-center gap-1 rounded-md px-2 py-1 text-[12px] text-[var(--text-dim)] transition hover:bg-[var(--bg-active)] hover:text-[var(--text-muted)]">
+                {activeLabel}<ChevronIcon open={showModelPicker} />
+              </button>
+              {showModelPicker && (
+                <>
+                  <div className="fixed inset-0 z-10" onClick={() => setShowModelPicker(false)} />
+                  <div className="absolute bottom-full left-0 z-20 mb-1 w-48 overflow-hidden rounded-lg border border-[var(--border-strong)] bg-[var(--bg-elevated)] py-1 shadow-xl shadow-black/40">
+                    {available.length === 0 ? (
+                      <div className="px-3 py-2 text-[11px] text-[var(--text-dimmer)]">No providers authorized</div>
+                    ) : (
+                      available.map((m) => (
+                        <button key={m.id} type="button" onClick={() => { void pickModel(m.id); }} className={`flex w-full items-center justify-between px-3 py-[6px] text-left text-[12px] transition hover:bg-[var(--bg-active)] ${m.id === activeId ? "text-[var(--text-primary)]" : "text-[var(--text-muted)]"}`}>
+                          <span>{m.label}</span><span className="text-[10px] text-[var(--text-dimmer)]">{m.provider === "anthropic" ? "Anthropic" : "OpenAI"}</span>
+                        </button>
+                      ))
+                    )}
+                  </div>
+                </>
+              )}
+            </div>
+            <div className="mx-1 h-3.5 w-px bg-[var(--bg-active)]" />
+            <button type="button" onClick={() => setPermission((p) => (p === "full" ? "approve" : "full"))} className="flex items-center gap-1 rounded-md px-2 py-1 text-[12px] text-[var(--text-dim)] transition hover:bg-[var(--bg-active)] hover:text-[var(--text-muted)]">
+              {permission === "full" ? <UnlockIcon /> : <LockIcon />}
+              {permission === "full" ? "Full access" : "Ask first"}
+            </button>
+            <div className="mx-1 h-3.5 w-px bg-[var(--bg-active)]" />
+            <ThinkingLevelPicker
+              level={thinkingLevel}
+              provider={thinkingProvider}
+              onChange={updateThinkingLevel}
+            />
+            <div className="ml-auto">
+              {isBusy ? (
+                <button type="button" onClick={() => { void onCancel(); }} className="grid h-8 w-8 place-items-center rounded-full bg-[var(--bg-stop)] text-[var(--text-primary)] transition hover:bg-[var(--bg-stop-hover)]" title="Stop"><StopIcon /></button>
+              ) : (
+                <button type="submit" disabled={!selThreadId || (!msgInput.trim() && pendingImages.length === 0)} className="grid h-8 w-8 place-items-center rounded-full bg-[var(--bg-accent)] text-[var(--text-on-accent)] transition hover:bg-[var(--bg-accent-hover)] disabled:opacity-20"><SendIcon /></button>
+              )}
+            </div>
+          </div>
+        </div>
+      </form>
+    </div>
+  );
+}, (prev, next) => (
+  prev.todos === next.todos &&
+  prev.dragOver === next.dragOver &&
+  prev.pendingImages === next.pendingImages &&
+  prev.msgInput === next.msgInput &&
+  prev.providers === next.providers &&
+  prev.showModelPicker === next.showModelPicker &&
+  prev.permission === next.permission &&
+  prev.thinkingLevel === next.thinkingLevel &&
+  prev.thinkingProvider === next.thinkingProvider &&
+  prev.isBusy === next.isBusy &&
+  prev.selThreadId === next.selThreadId
+));
+
+const SidebarPanel = React.memo(function SidebarPanel({
+  projects,
+  threads,
+  selProject,
+  selThreadId,
+  expandedProjects,
+  runningThreads,
+  threadMessageMeta,
+  contextMenu,
+  showFileTree,
+  setShowSettings,
+  setExpandedProjects,
+  setSelProjectId,
+  setSelThreadId,
+  setContextMenu,
+  setShowFileTree,
+  onAddThread,
+  onDeleteThread,
+  onAddProject,
+  onOpenFileInSidebar,
+}: {
+  projects: Project[];
+  threads: AppState["threads"];
+  selProject: Project | null;
+  selThreadId: string | null;
+  expandedProjects: Set<string>;
+  runningThreads: Set<string>;
+  threadMessageMeta: ThreadMessageMetaMap;
+  contextMenu: { x: number; y: number; threadId: string } | null;
+  showFileTree: boolean;
+  setShowSettings: React.Dispatch<React.SetStateAction<boolean>>;
+  setExpandedProjects: React.Dispatch<React.SetStateAction<Set<string>>>;
+  setSelProjectId: React.Dispatch<React.SetStateAction<string | null>>;
+  setSelThreadId: React.Dispatch<React.SetStateAction<string | null>>;
+  setContextMenu: React.Dispatch<React.SetStateAction<{ x: number; y: number; threadId: string } | null>>;
+  setShowFileTree: React.Dispatch<React.SetStateAction<boolean>>;
+  onAddThread: (project: Project) => Promise<void>;
+  onDeleteThread: (threadId: string) => Promise<void>;
+  onAddProject: () => Promise<void>;
+  onOpenFileInSidebar: (relativePath: string) => Promise<void>;
+}) {
+  return (
+    <aside className="flex w-[260px] shrink-0 flex-col">
+      <div className="drag-region flex h-12 shrink-0 items-center px-4 pt-1">
+        <div className="no-drag flex items-center">
+          <span className="text-[14px] font-bold tracking-tight"><span className="text-[var(--brand-sn)]">Sn</span><span className="text-[var(--brand-code)]">Code</span></span>
+        </div>
+        <button onClick={() => setShowSettings(true)} className="no-drag ml-auto grid h-7 w-7 place-items-center rounded-lg text-[var(--text-dim)] transition hover:bg-[var(--bg-elevated)] hover:text-[var(--text-muted)]" title="Settings"><GearIcon /></button>
+      </div>
+
+      <div className="px-3 pb-1.5">
+        <button onClick={() => { if (selProject) void onAddThread(selProject); }} disabled={!selProject} className="w-full rounded-lg border border-[var(--border-strong)] bg-[var(--bg-card)] px-3 py-2 text-left text-[13px] text-[var(--text-muted)] transition hover:border-[var(--border-active)] hover:bg-[var(--bg-elevated)] hover:text-[var(--text-label)] disabled:opacity-30">+ New thread</button>
+      </div>
+
+      <div className="min-h-0 flex-1 overflow-auto px-2 pb-2">
+        {projects.map((project) => {
+          const projectThreads = threads.filter((t) => t.projectId === project.id);
+          const expanded = expandedProjects.has(project.id);
+          return (
+            <div key={project.id} className="mb-0.5">
+              <button
+                onClick={() => {
+                  setExpandedProjects((prev) => {
+                    const next = new Set(prev);
+                    if (next.has(project.id)) next.delete(project.id);
+                    else next.add(project.id);
+                    return next;
+                  });
+                  setSelProjectId(project.id);
+                }}
+                className="group flex w-full items-center gap-1.5 rounded-lg px-2.5 py-[6px] text-left transition hover:bg-[var(--bg-card)]"
+              >
+                <svg width="9" height="9" viewBox="0 0 10 10" fill="currentColor" className={`shrink-0 text-[var(--text-dimmer)] transition-transform ${expanded ? "rotate-90" : ""}`}><path d="M3 1l4 4-4 4z" /></svg>
+                <span className="flex-1 truncate text-[13px] font-medium text-[var(--text-label)]">{project.name}</span>
+                <span className="text-[11px] text-[var(--text-dimmer)]">{projectThreads.length}</span>
+              </button>
+              {expanded && (
+                <div className="ml-3 space-y-px border-l border-[var(--border)] pl-1.5">
+                  {projectThreads.map((thread) => {
+                    const active = thread.id === selThreadId;
+                    const last = threadMessageMeta.get(thread.id)?.last;
+                    return (
+                      <div key={thread.id} className="group relative">
+                        <button
+                          onClick={() => { setSelProjectId(project.id); setSelThreadId(thread.id); }}
+                          onContextMenu={(ev) => {
+                            ev.preventDefault();
+                            setContextMenu({ x: ev.clientX, y: ev.clientY, threadId: thread.id });
+                          }}
+                          className={`flex w-full items-center justify-between rounded-lg px-2.5 py-[6px] pr-7 text-left text-[13px] transition ${active ? "bg-[var(--bg-elevated)] text-[var(--text-primary)]" : "text-[var(--text-muted)] hover:bg-[var(--bg-card)] hover:text-[var(--text-label)]"}`}
+                        >
+                          <span className="flex min-w-0 items-center gap-1.5">
+                            {runningThreads.has(thread.id) && <span className="h-1.5 w-1.5 shrink-0 animate-pulse rounded-full bg-emerald-500" />}
+                            <span className="min-w-0 truncate">{thread.title}</span>
+                          </span>
+                          <span className="shrink-0 text-[10px] text-[var(--text-dimmer)] group-hover:hidden">{last ? timeAgo(last.createdAt) : ""}</span>
+                        </button>
+                        <button onClick={(ev) => { ev.stopPropagation(); void onDeleteThread(thread.id); }} className="absolute right-1.5 top-1/2 hidden -translate-y-1/2 rounded-md p-1 text-[var(--text-dim)] transition hover:bg-[var(--bg-active)] hover:text-red-400 group-hover:block" title="Delete thread"><TrashIcon /></button>
+                      </div>
+                    );
+                  })}
+                  <button
+                    onClick={() => { void onAddThread(project); }}
+                    className="flex w-full items-center gap-1.5 rounded-lg px-2.5 py-[6px] text-left text-[12px] text-[var(--text-dimmer)] transition hover:bg-[var(--bg-card)] hover:text-[var(--text-muted)]"
+                  >
+                    <svg width="10" height="10" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="2" className="shrink-0"><path d="M8 2v12M2 8h12" /></svg>
+                    New thread
+                  </button>
+                </div>
+              )}
+            </div>
+          );
+        })}
+      </div>
+
+      {showFileTree && selProject && (
+        <div className="border-t border-[var(--border-subtle)]">
+          <div className="flex items-center justify-between px-3 py-1.5">
+            <span className="text-[11px] font-medium text-[var(--text-dim)]">Files</span>
+            <button onClick={() => setShowFileTree(false)} className="text-[var(--text-dim)] transition hover:text-[var(--text-muted)]"><XIcon /></button>
+          </div>
+          <FileTreePanel projectPath={selProject.folderPath} onFileClick={onOpenFileInSidebar} />
+        </div>
+      )}
+
+      <div className="border-t border-[var(--border-subtle)] p-3">
+        <div className="flex gap-2">
+          <button onClick={() => { void onAddProject(); }} className="flex-1 rounded-lg px-3 py-2 text-left text-[13px] text-[var(--text-dim)] transition hover:bg-[var(--bg-card)] hover:text-[var(--text-muted)]">+ Add project</button>
+          {selProject && (
+            <button onClick={() => setShowFileTree((v) => !v)} className={`grid h-8 w-8 place-items-center rounded-lg transition ${showFileTree ? "bg-[var(--bg-elevated)] text-[var(--text-muted)]" : "text-[var(--text-dim)] hover:bg-[var(--bg-card)] hover:text-[var(--text-muted)]"}`} title="Toggle file tree (Ctrl+B)">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z" /></svg>
+            </button>
+          )}
+        </div>
+      </div>
+
+      {contextMenu && (
+        <>
+          <div className="fixed inset-0 z-40" onClick={() => setContextMenu(null)} onContextMenu={(ev) => { ev.preventDefault(); setContextMenu(null); }} />
+          <div
+            className="fixed z-50 min-w-[140px] overflow-hidden rounded-lg border border-[var(--border-strong)] bg-[var(--bg-elevated)] py-1 shadow-xl shadow-black/50"
+            style={{ left: contextMenu.x, top: contextMenu.y }}
+          >
+            <button
+              onClick={() => { void onDeleteThread(contextMenu.threadId); setContextMenu(null); }}
+              className="flex w-full items-center gap-2 px-3 py-[6px] text-left text-[12px] text-red-400 transition hover:bg-[var(--bg-active)]"
+            >
+              <TrashIcon />
+              Delete thread
+            </button>
+          </div>
+        </>
+      )}
+    </aside>
+  );
+}, (prev, next) => (
+  prev.projects === next.projects &&
+  prev.threads === next.threads &&
+  prev.selProject === next.selProject &&
+  prev.selThreadId === next.selThreadId &&
+  prev.expandedProjects === next.expandedProjects &&
+  prev.runningThreads === next.runningThreads &&
+  prev.threadMessageMeta === next.threadMessageMeta &&
+  prev.contextMenu === next.contextMenu &&
+  prev.showFileTree === next.showFileTree
+));
+
 /* ── App ── */
 
 export default function App() {
@@ -1630,13 +2413,7 @@ export default function App() {
   const [currentBranch, setCurrentBranch] = useState("");
   const [gitStatus, setGitStatus] = useState<GitStatusInfo>({ changes: 0, staged: 0, isRepo: false });
   // Right sidebar state — subagent uses msgId for live reactivity (reads from state.messages)
-  const [rightSidebar, setRightSidebar] = useState<{
-    type: "file" | "diff" | "subagent";
-    filePath?: string;
-    fileContent?: string;
-    diffs?: GitDiffEntry[];
-    taskMsgId?: string;
-  } | null>(null);
+  const [rightSidebar, setRightSidebar] = useState<RightSidebarState | null>(null);
   // Git actions dropdown
   const [showGitActions, setShowGitActions] = useState(false);
   const [gitActionFeedback, setGitActionFeedback] = useState("");
@@ -1651,10 +2428,16 @@ export default function App() {
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const scrollContainerRef = useRef<HTMLDivElement>(null);
   const isNearBottomRef = useRef(true);
+  const scrollRafRef = useRef<number | null>(null);
+  const [chatScrollTop, setChatScrollTop] = useState(0);
+  const [chatViewportHeight, setChatViewportHeight] = useState(0);
+  const streamChunkBufferRef = useRef("");
+  const streamChunkRafRef = useRef<number | null>(null);
 
   // Derive isBusy for the currently selected thread
   const isBusy = selThreadId ? runningThreads.has(selThreadId) : false;
   const theme = state.settings.theme || "dark";
+  const deferredSearchHighlight = useDeferredValue(searchHighlight);
 
   // Apply theme to document
   useEffect(() => {
@@ -1664,6 +2447,19 @@ export default function App() {
   const selProject = useMemo(() => state.projects.find((p) => p.id === selProjectId) ?? null, [state.projects, selProjectId]);
   const selThread = useMemo(() => state.threads.find((t) => t.id === selThreadId) ?? null, [state.threads, selThreadId]);
   const threadMessages = useMemo(() => state.messages.filter((m) => m.threadId === selThreadId), [state.messages, selThreadId]);
+  const threadMessageMeta = useMemo<ThreadMessageMetaMap>(() => {
+    const map: ThreadMessageMetaMap = new Map();
+    for (const msg of state.messages) {
+      const prev = map.get(msg.threadId);
+      if (prev) {
+        prev.count += 1;
+        prev.last = msg;
+      } else {
+        map.set(msg.threadId, { count: 1, last: msg });
+      }
+    }
+    return map;
+  }, [state.messages]);
 
   // Comprehensive thread stats: tokens, tool calls, context, pricing
   const threadStats = useMemo(() => {
@@ -1689,6 +2485,10 @@ export default function App() {
     const cost = estimateCost(modelId, inputTokens, outputTokens);
     return { inputTokens, outputTokens, totalTokens, toolCalls, userMsgs, assistantMsgs, contextTokens, contextWindow, contextPct, cost, modelId };
   }, [threadMessages, state.providers]);
+  const liveRightSidebarTaskMsg = useMemo(() => {
+    if (!rightSidebar || rightSidebar.type !== "subagent" || !rightSidebar.taskMsgId) return undefined;
+    return state.messages.find((m) => m.id === rightSidebar.taskMsgId);
+  }, [rightSidebar, state.messages]);
 
   /* ── effects ── */
 
@@ -1708,6 +2508,16 @@ export default function App() {
 
   // Agent events — status tracked globally, chunks/messages only for selected thread
   useEffect(() => {
+    const flushStreamChunk = () => {
+      streamChunkRafRef.current = null;
+      const buffered = streamChunkBufferRef.current;
+      if (!buffered) return;
+      streamChunkBufferRef.current = "";
+      startTransition(() => {
+        setStreamChunk((prev) => prev + buffered);
+      });
+    };
+
     const off1 = window.sncode.on("agent:status", (e) => {
       // Always update the global running set regardless of selected thread
       setRunningThreads((prev) => {
@@ -1720,6 +2530,11 @@ export default function App() {
       if (e.threadId === selThreadId) {
         setStatusText(e.detail);
         if (e.status !== "running") {
+          streamChunkBufferRef.current = "";
+          if (streamChunkRafRef.current !== null) {
+            cancelAnimationFrame(streamChunkRafRef.current);
+            streamChunkRafRef.current = null;
+          }
           setStreamChunk("");
           // Final refresh to reconcile state (thread title, messages, etc.)
           void refresh();
@@ -1728,7 +2543,10 @@ export default function App() {
     });
     const off2 = window.sncode.on("agent:chunk", (e) => {
       if (e.threadId !== selThreadId) return;
-      setStreamChunk((prev) => prev + e.chunk);
+      streamChunkBufferRef.current += e.chunk;
+      if (streamChunkRafRef.current === null) {
+        streamChunkRafRef.current = requestAnimationFrame(flushStreamChunk);
+      }
     });
     const off3 = window.sncode.on("agent:tool", () => {
       // Tool presence is now shown via pending tool messages — no separate indicator needed
@@ -1736,25 +2554,44 @@ export default function App() {
     // Real-time message insertion / update (intermediate text + tool results)
     const off4 = window.sncode.on("agent:message", (e) => {
       if (e.threadId !== selThreadId) return;
-      setState((prev) => {
-        const existingIdx = prev.messages.findIndex((m) => m.id === e.message.id);
-        if (existingIdx >= 0) {
-          // Update existing message (e.g. pending tool → completed)
-          const updated = [...prev.messages];
-          updated[existingIdx] = e.message;
-          return { ...prev, messages: updated };
-        }
-        // Append new message
-        return { ...prev, messages: [...prev.messages, e.message] };
+      startTransition(() => {
+        setState((prev) => {
+          const existingIdx = prev.messages.findIndex((m) => m.id === e.message.id);
+          if (existingIdx >= 0) {
+            // Update existing message (e.g. pending tool → completed)
+            const updated = [...prev.messages];
+            updated[existingIdx] = e.message;
+            return { ...prev, messages: updated };
+          }
+          // Append new message
+          return { ...prev, messages: [...prev.messages, e.message] };
+        });
       });
       // Clear streaming preview — the streamed text is now a stored message
+      streamChunkBufferRef.current = "";
+      if (streamChunkRafRef.current !== null) {
+        cancelAnimationFrame(streamChunkRafRef.current);
+        streamChunkRafRef.current = null;
+      }
       setStreamChunk("");
     });
-    return () => { off1(); off2(); off3(); off4(); };
+    return () => {
+      if (streamChunkRafRef.current !== null) {
+        cancelAnimationFrame(streamChunkRafRef.current);
+        streamChunkRafRef.current = null;
+      }
+      streamChunkBufferRef.current = "";
+      off1(); off2(); off3(); off4();
+    };
   }, [selThreadId]);
 
   // When switching threads: clear stale stream state and refresh messages from store
   useEffect(() => {
+    streamChunkBufferRef.current = "";
+    if (streamChunkRafRef.current !== null) {
+      cancelAnimationFrame(streamChunkRafRef.current);
+      streamChunkRafRef.current = null;
+    }
     setStreamChunk("");
     setStatusText(selThreadId && runningThreads.has(selThreadId) ? "Running" : "Idle");
     // Refresh to load any messages stored while we were on a different thread
@@ -1792,6 +2629,35 @@ export default function App() {
     if (!el) return;
     const threshold = 120; // px from bottom
     isNearBottomRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < threshold;
+    if (scrollRafRef.current !== null) return;
+    scrollRafRef.current = requestAnimationFrame(() => {
+      scrollRafRef.current = null;
+      const current = scrollContainerRef.current;
+      if (!current) return;
+      setChatScrollTop(current.scrollTop);
+      setChatViewportHeight(current.clientHeight);
+    });
+  }, []);
+
+  useEffect(() => {
+    const el = scrollContainerRef.current;
+    if (!el) return;
+    setChatScrollTop(el.scrollTop);
+    setChatViewportHeight(el.clientHeight);
+
+    if (typeof ResizeObserver !== "undefined") {
+      const ro = new ResizeObserver(() => {
+        const current = scrollContainerRef.current;
+        if (!current) return;
+        setChatViewportHeight(current.clientHeight);
+      });
+      ro.observe(el);
+      return () => ro.disconnect();
+    }
+  }, [selThreadId, rightSidebar]);
+
+  useEffect(() => () => {
+    if (scrollRafRef.current !== null) cancelAnimationFrame(scrollRafRef.current);
   }, []);
 
   useEffect(() => {
@@ -1950,9 +2816,9 @@ export default function App() {
     window.sncode.getGitBranches(selProject.folderPath).then((r) => { setGitBranches(r.branches); setCurrentBranch(r.current); });
   }
 
-  function openSubAgentInSidebar(msg: ThreadMessage) {
+  const openSubAgentInSidebar = useCallback((msg: ThreadMessage) => {
     setRightSidebar({ type: "subagent", taskMsgId: msg.id });
-  }
+  }, []);
 
   // Todo system
   function addTodo(content: string) {
@@ -2022,121 +2888,27 @@ export default function App() {
     <div className="flex h-screen text-[var(--text-primary)]" style={{ background: "var(--bg-base)" }}>
 
       {/* ─── Sidebar ─── */}
-      <aside className="flex w-[260px] shrink-0 flex-col">
-        <div className="drag-region flex h-12 shrink-0 items-center px-4 pt-1">
-          <div className="no-drag flex items-center">
-            <span className="text-[14px] font-bold tracking-tight"><span className="text-[var(--brand-sn)]">Sn</span><span className="text-[var(--brand-code)]">Code</span></span>
-          </div>
-          <button onClick={() => setShowSettings(true)} className="no-drag ml-auto grid h-7 w-7 place-items-center rounded-lg text-[var(--text-dim)] transition hover:bg-[var(--bg-elevated)] hover:text-[var(--text-muted)]" title="Settings"><GearIcon /></button>
-        </div>
-
-        <div className="px-3 pb-1.5">
-          <button onClick={() => selProject && addThread(selProject)} disabled={!selProject} className="w-full rounded-lg border border-[var(--border-strong)] bg-[var(--bg-card)] px-3 py-2 text-left text-[13px] text-[var(--text-muted)] transition hover:border-[var(--border-active)] hover:bg-[var(--bg-elevated)] hover:text-[var(--text-label)] disabled:opacity-30">+ New thread</button>
-        </div>
-
-        <div className="min-h-0 flex-1 overflow-auto px-2 pb-2">
-          {state.projects.map((project) => {
-            const threads = state.threads.filter((t) => t.projectId === project.id);
-            const expanded = expandedProjects.has(project.id);
-            return (
-              <div key={project.id} className="mb-0.5">
-                <button
-                  onClick={() => {
-                    setExpandedProjects((prev) => {
-                      const next = new Set(prev);
-                      if (next.has(project.id)) next.delete(project.id);
-                      else next.add(project.id);
-                      return next;
-                    });
-                    setSelProjectId(project.id);
-                  }}
-                  className="group flex w-full items-center gap-1.5 rounded-lg px-2.5 py-[6px] text-left transition hover:bg-[var(--bg-card)]"
-                >
-                  <svg width="9" height="9" viewBox="0 0 10 10" fill="currentColor" className={`shrink-0 text-[var(--text-dimmer)] transition-transform ${expanded ? "rotate-90" : ""}`}><path d="M3 1l4 4-4 4z" /></svg>
-                  <span className="flex-1 truncate text-[13px] font-medium text-[var(--text-label)]">{project.name}</span>
-                  <span className="text-[11px] text-[var(--text-dimmer)]">{threads.length}</span>
-                </button>
-                {expanded && (
-                  <div className="ml-3 space-y-px border-l border-[var(--border)] pl-1.5">
-                    {threads.map((thread) => {
-                      const active = thread.id === selThreadId;
-                      const msgs = state.messages.filter((m) => m.threadId === thread.id);
-                      const last = msgs[msgs.length - 1];
-                      return (
-                        <div key={thread.id} className="group relative">
-                          <button
-                            onClick={() => { setSelProjectId(project.id); setSelThreadId(thread.id); }}
-                            onContextMenu={(ev) => {
-                              ev.preventDefault();
-                              setContextMenu({ x: ev.clientX, y: ev.clientY, threadId: thread.id });
-                            }}
-                            className={`flex w-full items-center justify-between rounded-lg px-2.5 py-[6px] pr-7 text-left text-[13px] transition ${active ? "bg-[var(--bg-elevated)] text-[var(--text-primary)]" : "text-[var(--text-muted)] hover:bg-[var(--bg-card)] hover:text-[var(--text-label)]"}`}
-                          >
-                            <span className="flex min-w-0 items-center gap-1.5">
-                              {runningThreads.has(thread.id) && <span className="h-1.5 w-1.5 shrink-0 animate-pulse rounded-full bg-emerald-500" />}
-                              <span className="min-w-0 truncate">{thread.title}</span>
-                            </span>
-                            <span className="shrink-0 text-[10px] text-[var(--text-dimmer)] group-hover:hidden">{last ? timeAgo(last.createdAt) : ""}</span>
-                          </button>
-                          <button onClick={(ev) => { ev.stopPropagation(); void deleteThread(thread.id); }} className="absolute right-1.5 top-1/2 hidden -translate-y-1/2 rounded-md p-1 text-[var(--text-dim)] transition hover:bg-[var(--bg-active)] hover:text-red-400 group-hover:block" title="Delete thread"><TrashIcon /></button>
-                        </div>
-                      );
-                    })}
-                    <button
-                      onClick={() => addThread(project)}
-                      className="flex w-full items-center gap-1.5 rounded-lg px-2.5 py-[6px] text-left text-[12px] text-[var(--text-dimmer)] transition hover:bg-[var(--bg-card)] hover:text-[var(--text-muted)]"
-                    >
-                      <svg width="10" height="10" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="2" className="shrink-0"><path d="M8 2v12M2 8h12" /></svg>
-                      New thread
-                    </button>
-                  </div>
-                )}
-              </div>
-            );
-          })}
-        </div>
-
-        {/* File tree panel */}
-        {showFileTree && selProject && (
-          <div className="border-t border-[var(--border-subtle)]">
-            <div className="flex items-center justify-between px-3 py-1.5">
-              <span className="text-[11px] font-medium text-[var(--text-dim)]">Files</span>
-              <button onClick={() => setShowFileTree(false)} className="text-[var(--text-dim)] transition hover:text-[var(--text-muted)]"><XIcon /></button>
-            </div>
-            <FileTreePanel projectPath={selProject.folderPath} onFileClick={openFileInSidebar} />
-          </div>
-        )}
-
-        <div className="border-t border-[var(--border-subtle)] p-3">
-          <div className="flex gap-2">
-            <button onClick={addProject} className="flex-1 rounded-lg px-3 py-2 text-left text-[13px] text-[var(--text-dim)] transition hover:bg-[var(--bg-card)] hover:text-[var(--text-muted)]">+ Add project</button>
-            {selProject && (
-              <button onClick={() => setShowFileTree((v) => !v)} className={`grid h-8 w-8 place-items-center rounded-lg transition ${showFileTree ? "bg-[var(--bg-elevated)] text-[var(--text-muted)]" : "text-[var(--text-dim)] hover:bg-[var(--bg-card)] hover:text-[var(--text-muted)]"}`} title="Toggle file tree (Ctrl+B)">
-                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z" /></svg>
-              </button>
-            )}
-          </div>
-        </div>
-
-        {/* Thread context menu */}
-        {contextMenu && (
-          <>
-            <div className="fixed inset-0 z-40" onClick={() => setContextMenu(null)} onContextMenu={(ev) => { ev.preventDefault(); setContextMenu(null); }} />
-            <div
-              className="fixed z-50 min-w-[140px] overflow-hidden rounded-lg border border-[var(--border-strong)] bg-[var(--bg-elevated)] py-1 shadow-xl shadow-black/50"
-              style={{ left: contextMenu.x, top: contextMenu.y }}
-            >
-              <button
-                onClick={() => { void deleteThread(contextMenu.threadId); setContextMenu(null); }}
-                className="flex w-full items-center gap-2 px-3 py-[6px] text-left text-[12px] text-red-400 transition hover:bg-[var(--bg-active)]"
-              >
-                <TrashIcon />
-                Delete thread
-              </button>
-            </div>
-          </>
-        )}
-      </aside>
+      <SidebarPanel
+        projects={state.projects}
+        threads={state.threads}
+        selProject={selProject}
+        selThreadId={selThreadId}
+        expandedProjects={expandedProjects}
+        runningThreads={runningThreads}
+        threadMessageMeta={threadMessageMeta}
+        contextMenu={contextMenu}
+        showFileTree={showFileTree}
+        setShowSettings={setShowSettings}
+        setExpandedProjects={setExpandedProjects}
+        setSelProjectId={setSelProjectId}
+        setSelThreadId={setSelThreadId}
+        setContextMenu={setContextMenu}
+        setShowFileTree={setShowFileTree}
+        onAddThread={addThread}
+        onDeleteThread={deleteThread}
+        onAddProject={addProject}
+        onOpenFileInSidebar={openFileInSidebar}
+      />
 
       {/* ─── Main content (floating card) ─── */}
       <main className="flex min-h-0 min-w-0 flex-1 flex-col py-2 pr-2">
@@ -2255,220 +3027,47 @@ export default function App() {
           {/* Messages */}
           <div ref={scrollContainerRef} onScroll={handleScroll} className="min-h-0 flex-1 overflow-auto">
             <div className="mx-auto max-w-[820px] px-5 py-5">
-              {threadMessages.length === 0 && !streamChunk ? (
-                <div className="mt-32 text-center">
-                  <div className="mb-3 text-[22px] font-semibold text-[var(--text-heading)]">What are you building?</div>
-                  <p className="text-[13px] text-[var(--text-dim)]">Ask anything about your project — or start with a suggestion.</p>
-                </div>
-              ) : (
-                <div className="space-y-4">
-                  {threadMessages.map((msg) => {
-                    const isUser = msg.role === "user";
-                    const isTool = msg.role === "tool";
-                    const isError = msg.metadata?.isError;
-                    return (
-                      <div key={msg.id} id={`msg-${msg.id}`}>
-                        {isTool && msg.metadata?.isTask ? (
-                          <TaskMessage msg={msg} onClickDetail={openSubAgentInSidebar} />
-                        ) : isTool ? (
-                          <ToolMessage msg={msg} />
-                        ) : isUser ? (
-                          <div className="flex justify-end">
-                            <div className="max-w-[80%]">
-                              <div className="rounded-2xl rounded-br-sm bg-[var(--bg-user-bubble)] px-4 py-2.5">
-                                {msg.images && msg.images.length > 0 && (
-                                  <div className="mb-2 flex flex-wrap gap-2">
-                                    {msg.images.map((img, i) => (
-                                      <img
-                                        key={i}
-                                        src={`data:${img.mediaType};base64,${img.data}`}
-                                        alt={img.name || "Attachment"}
-                                        className="max-h-[200px] max-w-full rounded-lg border border-[var(--border-active)] object-contain"
-                                      />
-                                    ))}
-                                  </div>
-                                )}
-                                {msg.content && (
-                                  <pre className="whitespace-pre-wrap font-sans text-[13px] leading-relaxed text-[var(--text-bright)]">
-                                    {searchHighlight ? <HighlightText text={msg.content} query={searchHighlight} /> : msg.content}
-                                  </pre>
-                                )}
-                              </div>
-                              <div className="mt-0.5 text-right text-[10px] text-[var(--text-dimmest)]">
-                                {new Date(msg.createdAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}
-                              </div>
-                            </div>
-                          </div>
-                        ) : (
-                          <div>
-                            <div className={`text-[13px] ${isError ? "text-red-400/90" : "text-[var(--text-secondary)]"}`}>
-                              <Markdown content={msg.content} searchHighlight={searchHighlight} />
-                            </div>
-                            <div className="mt-0.5 flex items-center gap-2 text-[10px] text-[var(--text-dimmest)]">
-                              <span>{new Date(msg.createdAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}</span>
-                              {(msg.metadata?.inputTokens || msg.metadata?.outputTokens) && (
-                                <span className="text-[var(--text-dimmest)]" title={`Input: ${msg.metadata.inputTokens?.toLocaleString() ?? 0} | Output: ${msg.metadata.outputTokens?.toLocaleString() ?? 0}`}>
-                                  {((msg.metadata.inputTokens ?? 0) + (msg.metadata.outputTokens ?? 0)).toLocaleString()} tokens
-                                </span>
-                              )}
-                            </div>
-                          </div>
-                        )}
-                      </div>
-                    );
-                  })}
-
-                  {/* Streaming preview */}
-                  {streamChunk && (
-                    <div className="text-[13px] text-[var(--text-secondary)]">
-                      <Markdown content={streamChunk} />
-                      <span className="inline-block animate-pulse text-[var(--text-dimmer)]">|</span>
-                    </div>
-                  )}
-
-                  {/* Loading dots */}
-                  {isBusy && !streamChunk && (
-                    <div className="flex items-center gap-2 py-1">
-                      <div className="flex gap-[3px]">
-                        <div className="h-1 w-1 animate-bounce rounded-full bg-[var(--text-dimmer)]" style={{ animationDelay: "0ms" }} />
-                        <div className="h-1 w-1 animate-bounce rounded-full bg-[var(--text-dimmer)]" style={{ animationDelay: "150ms" }} />
-                        <div className="h-1 w-1 animate-bounce rounded-full bg-[var(--text-dimmer)]" style={{ animationDelay: "300ms" }} />
-                      </div>
-                      <span className="text-[11px] text-[var(--text-dimmer)]">{statusText}</span>
-                    </div>
-                  )}
-
-                  <div ref={messagesEndRef} />
-                </div>
-              )}
+              <ChatMessagesPane
+                messages={threadMessages}
+                streamChunk={streamChunk}
+                isBusy={isBusy}
+                statusText={statusText}
+                searchHighlight={deferredSearchHighlight}
+                onOpenSubAgent={openSubAgentInSidebar}
+                messagesEndRef={messagesEndRef}
+                scrollTop={chatScrollTop}
+                viewportHeight={chatViewportHeight}
+              />
             </div>
           </div>
 
-          {/* Todo panel + Composer */}
-          <div className="shrink-0 px-4 pb-4 pt-1">
-            <div className="mx-auto max-w-[820px]">
-              <TodoPanel todos={todos} onToggle={toggleTodo} onRemove={removeTodo} onAdd={addTodo} />
-            </div>
-            <form onSubmit={send} className="mx-auto max-w-[820px]">
-              <div
-                className={`rounded-xl border bg-[var(--bg-elevated)] transition-colors focus-within:border-[var(--border-active)] ${dragOver ? "border-blue-500/50 bg-[var(--bg-drag-highlight)]" : "border-[var(--border)]"}`}
-                onDragOver={(e) => { e.preventDefault(); setDragOver(true); }}
-                onDragLeave={() => setDragOver(false)}
-                onDrop={async (e) => {
-                  e.preventDefault();
-                  setDragOver(false);
-                  if (e.dataTransfer.files.length > 0) {
-                    await addImages(e.dataTransfer.files);
-                  }
-                }}
-              >
-                {/* Image previews */}
-                {pendingImages.length > 0 && (
-                  <div className="flex flex-wrap gap-2 px-3.5 pt-2.5">
-                    {pendingImages.map((img, i) => (
-                      <div key={i} className="group relative">
-                        <img
-                          src={`data:${img.mediaType};base64,${img.data}`}
-                          alt={img.name || "Attachment"}
-                          className="h-16 w-16 rounded-lg border border-[var(--border-active)] object-cover"
-                        />
-                        <button
-                          type="button"
-                          onClick={() => removeImage(i)}
-                          className="absolute -right-1.5 -top-1.5 hidden h-4 w-4 items-center justify-center rounded-full bg-[var(--bg-stop)] text-[var(--text-muted)] transition hover:bg-red-500 hover:text-white group-hover:flex"
-                        >
-                          <XIcon />
-                        </button>
-                        {img.name && (
-                          <div className="absolute inset-x-0 bottom-0 truncate rounded-b-lg bg-black/60 px-1 py-0.5 text-[9px] text-[var(--text-muted)]">{img.name}</div>
-                        )}
-                      </div>
-                    ))}
-                  </div>
-                )}
-
-                <textarea
-                  value={msgInput}
-                  onChange={(e) => setMsgInput(e.target.value)}
-                  onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(e); } }}
-                  onPaste={async (e) => {
-                    const items = e.clipboardData.items;
-                    const imageFiles: File[] = [];
-                    for (let i = 0; i < items.length; i++) {
-                      const item = items[i];
-                      if (item.type.startsWith("image/")) {
-                        const file = item.getAsFile();
-                        if (file) imageFiles.push(file);
-                      }
-                    }
-                    if (imageFiles.length > 0) {
-                      e.preventDefault();
-                      await addImages(imageFiles);
-                    }
-                  }}
-                  placeholder={pendingImages.length > 0 ? "Add a message or just send the image..." : "Type your message here..."}
-                  rows={2}
-                  className="w-full resize-none bg-transparent px-4 pt-3 pb-1.5 text-[13px] leading-relaxed text-[var(--text-primary)] outline-none placeholder:text-[var(--text-dimmest)]"
-                />
-                <input
-                  ref={fileInputRef}
-                  type="file"
-                  accept="image/jpeg,image/png,image/gif,image/webp"
-                  multiple
-                  className="hidden"
-                  onChange={(e) => {
-                    if (e.target.files) void addImages(e.target.files);
-                    e.target.value = "";
-                  }}
-                />
-                <div className="flex items-center px-3 pb-2.5">
-                  <button type="button" onClick={() => fileInputRef.current?.click()} className="grid h-7 w-7 place-items-center rounded-md text-[var(--text-dim)] transition hover:bg-[var(--bg-active)] hover:text-[var(--text-muted)]" title="Attach image">
-                    <PaperclipIcon />
-                  </button>
-                  <div className="mx-1 h-3.5 w-px bg-[var(--bg-active)]" />
-                  <div className="relative">
-                    <button type="button" onClick={() => setShowModelPicker((v) => !v)} className="flex items-center gap-1 rounded-md px-2 py-1 text-[12px] text-[var(--text-dim)] transition hover:bg-[var(--bg-active)] hover:text-[var(--text-muted)]">
-                      {activeModelLabel(state.providers)}<ChevronIcon open={showModelPicker} />
-                    </button>
-                    {showModelPicker && (
-                      <>
-                        <div className="fixed inset-0 z-10" onClick={() => setShowModelPicker(false)} />
-                        <div className="absolute bottom-full left-0 z-20 mb-1 w-48 overflow-hidden rounded-lg border border-[var(--border-strong)] bg-[var(--bg-elevated)] py-1 shadow-xl shadow-black/40">
-                          {availableModels(state.providers).length === 0 ? (
-                            <div className="px-3 py-2 text-[11px] text-[var(--text-dimmer)]">No providers authorized</div>
-                          ) : (
-                            availableModels(state.providers).map((m) => (
-                              <button key={m.id} type="button" onClick={() => pickModel(m.id)} className={`flex w-full items-center justify-between px-3 py-[6px] text-left text-[12px] transition hover:bg-[var(--bg-active)] ${m.id === activeModelId(state.providers) ? "text-[var(--text-primary)]" : "text-[var(--text-muted)]"}`}>
-                                <span>{m.label}</span><span className="text-[10px] text-[var(--text-dimmer)]">{m.provider === "anthropic" ? "Anthropic" : "OpenAI"}</span>
-                              </button>
-                            ))
-                          )}
-                        </div>
-                      </>
-                    )}
-                  </div>
-                  <div className="mx-1 h-3.5 w-px bg-[var(--bg-active)]" />
-                  <button type="button" onClick={() => setPermission((p) => (p === "full" ? "approve" : "full"))} className="flex items-center gap-1 rounded-md px-2 py-1 text-[12px] text-[var(--text-dim)] transition hover:bg-[var(--bg-active)] hover:text-[var(--text-muted)]">
-                    {permission === "full" ? <UnlockIcon /> : <LockIcon />}
-                    {permission === "full" ? "Full access" : "Ask first"}
-                  </button>
-                  <div className="mx-1 h-3.5 w-px bg-[var(--bg-active)]" />
-                  <ThinkingLevelPicker
-                    level={state.settings.thinkingLevel || "none"}
-                    provider={state.providers.find((p) => p.enabled)?.id ?? "anthropic"}
-                    onChange={(level) => { void updateSettings({ thinkingLevel: level }); }}
-                  />
-                  <div className="ml-auto">
-                    {isBusy ? (
-                      <button type="button" onClick={cancel} className="grid h-8 w-8 place-items-center rounded-full bg-[var(--bg-stop)] text-[var(--text-primary)] transition hover:bg-[var(--bg-stop-hover)]" title="Stop"><StopIcon /></button>
-                    ) : (
-                      <button type="submit" disabled={!selThreadId || (!msgInput.trim() && pendingImages.length === 0)} className="grid h-8 w-8 place-items-center rounded-full bg-[var(--bg-accent)] text-[var(--text-on-accent)] transition hover:bg-[var(--bg-accent-hover)] disabled:opacity-20"><SendIcon /></button>
-                    )}
-                  </div>
-                </div>
-              </div>
-            </form>
-          </div>
+          <ComposerPanel
+            todos={todos}
+            onToggleTodo={toggleTodo}
+            onRemoveTodo={removeTodo}
+            onAddTodo={addTodo}
+            onSend={send}
+            dragOver={dragOver}
+            setDragOver={setDragOver}
+            addImages={addImages}
+            pendingImages={pendingImages}
+            removeImage={removeImage}
+            msgInput={msgInput}
+            setMsgInput={setMsgInput}
+            fileInputRef={fileInputRef}
+            providers={state.providers}
+            showModelPicker={showModelPicker}
+            setShowModelPicker={setShowModelPicker}
+            pickModel={pickModel}
+            permission={permission}
+            setPermission={setPermission}
+            thinkingLevel={state.settings.thinkingLevel || "none"}
+            thinkingProvider={state.providers.find((p) => p.enabled)?.id ?? "anthropic"}
+            updateThinkingLevel={(level) => { void updateSettings({ thinkingLevel: level }); }}
+            isBusy={isBusy}
+            onCancel={cancel}
+            selThreadId={selThreadId}
+          />
 
           {/* ─── Bottom stats bar ─── */}
           {threadStats.totalTokens > 0 && (
@@ -2537,36 +3136,12 @@ export default function App() {
         </div>
       </main>
 
-      {/* ─── Right Panel ─── */}
-      {rightSidebar && (() => {
-        const isSubagent = rightSidebar.type === "subagent";
-        const liveTaskMsg = isSubagent && rightSidebar.taskMsgId ? state.messages.find((m) => m.id === rightSidebar.taskMsgId) : undefined;
-        return (
-          <div className={`flex min-w-0 flex-col ${isSubagent ? "w-[40vw] max-w-[560px] min-w-[320px]" : "w-[30vw] max-w-[420px] min-w-[280px]"}`}>
-            <div className="flex flex-1 flex-col m-2 ml-0 rounded-2xl border border-[var(--border)] bg-[var(--bg-card)] shadow-lg overflow-hidden">
-              {rightSidebar.type === "file" && rightSidebar.filePath && (
-                <RightSidebarFileView
-                  filePath={rightSidebar.filePath}
-                  content={rightSidebar.fileContent || ""}
-                  onClose={() => setRightSidebar(null)}
-                />
-              )}
-              {rightSidebar.type === "diff" && (
-                <RightSidebarDiffView
-                  diffs={rightSidebar.diffs || []}
-                  onClose={() => setRightSidebar(null)}
-                />
-              )}
-              {isSubagent && liveTaskMsg && (
-                <RightSidebarSubAgent
-                  msg={liveTaskMsg}
-                  onClose={() => setRightSidebar(null)}
-                />
-              )}
-            </div>
-          </div>
-        );
-      })()}
+      {/* â”€â”€â”€ Right Panel â”€â”€â”€ */}
+      <RightSidebarPane
+        rightSidebar={rightSidebar}
+        liveTaskMsg={liveRightSidebarTaskMsg}
+        onClose={() => setRightSidebar(null)}
+      />
 
       {/* ─── Commit modal ─── */}
       {showCommitModal && (
