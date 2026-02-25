@@ -351,6 +351,71 @@ export class Store {
     return Array.from(this.threadMessageMetaById.values()).map((entry) => ({ ...entry }));
   }
 
+  compactThread(threadId: string): { compacted: boolean; removed: number } {
+    const threadMessages = this.state.messages.filter((m) => m.threadId === threadId);
+    const KEEP_RECENT = 32;
+    if (threadMessages.length <= KEEP_RECENT) {
+      return { compacted: false, removed: 0 };
+    }
+
+    const removed = threadMessages.slice(0, threadMessages.length - KEEP_RECENT);
+    const kept = threadMessages.slice(threadMessages.length - KEEP_RECENT);
+    if (removed.length === 0) return { compacted: false, removed: 0 };
+
+    let summary = `[Context compacted manually at ${new Date().toISOString()}]\nSummary of earlier conversation:\n`;
+    let used = summary.length;
+    const MAX_SUMMARY_CHARS = 7000;
+    let lineCount = 0;
+    for (const msg of removed) {
+      if (msg.role !== "user" && msg.role !== "assistant") continue;
+      const snippet = msg.content.replace(/\s+/g, " ").trim();
+      if (!snippet) continue;
+      const clipped = snippet.length > 260 ? `${snippet.slice(0, 260)}...` : snippet;
+      const line = `- ${msg.role}: ${clipped}\n`;
+      if (used + line.length > MAX_SUMMARY_CHARS) break;
+      summary += line;
+      used += line.length;
+      lineCount += 1;
+    }
+    if (lineCount === 0) {
+      summary += `- Removed ${removed.length} earlier messages.\n`;
+    }
+
+    const removedIds = new Set(removed.map((m) => m.id));
+    const keptIds = new Set(kept.map((m) => m.id));
+    const summaryMsg: ThreadMessage = {
+      id: nanoid(),
+      threadId,
+      role: "assistant",
+      content: summary,
+      createdAt: now(),
+      metadata: { toolName: "compact_history", toolDetail: `Removed ${removed.length} old messages` },
+    };
+
+    const nextMessages: ThreadMessage[] = [];
+    let inserted = false;
+    for (const msg of this.state.messages) {
+      if (msg.threadId !== threadId) {
+        nextMessages.push(msg);
+        continue;
+      }
+      if (removedIds.has(msg.id)) continue;
+      if (!inserted && keptIds.has(msg.id)) {
+        nextMessages.push(summaryMsg);
+        inserted = true;
+      }
+      nextMessages.push(msg);
+    }
+    if (!inserted) nextMessages.push(summaryMsg);
+
+    this.state.messages = nextMessages;
+    const thread = this.state.threads.find((item) => item.id === threadId);
+    if (thread) thread.updatedAt = now();
+    this.rebuildThreadMessageMetaForThread(threadId);
+    this.persist();
+    return { compacted: true, removed: removed.length };
+  }
+
   getMessageById(messageId: string): ThreadMessage | undefined {
     const msg = this.state.messages.find((m) => m.id === messageId);
     return msg ? structuredClone(msg) : undefined;

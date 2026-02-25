@@ -598,8 +598,10 @@ async function sendMessageInternal(parsed: z.infer<typeof sendMessageInputSchema
   const previousController = runControllers.get(parsed.threadId);
   if (previousController) throw new Error("A run is already active for this thread");
 
-  store.appendMessage(parsed.threadId, "user", parsed.content, undefined, parsed.images);
-
+  const userMetadata = parsed.displayContent && parsed.displayContent.trim() && parsed.displayContent.trim() !== parsed.content.trim()
+    ? { userDisplayContent: parsed.displayContent }
+    : undefined;
+  store.appendMessage(parsed.threadId, "user", parsed.content, userMetadata, parsed.images);
   const threadMsgs = store.getMessages(parsed.threadId);
   const userMsgs = threadMsgs.filter((m) => m.role === "user");
   if (userMsgs.length === 1) {
@@ -746,6 +748,17 @@ function registerIpc() {
       lastModel: parsed.lastModel,
     });
     return updated ?? null;
+  });
+
+  ipcMain.handle("thread:compact", (_event, threadId: unknown) => {
+    const id = String(threadId || "");
+    if (!id) throw new Error("Thread ID is required");
+    const result = store.compactThread(id);
+    return {
+      state: toRendererState(store.getState()),
+      compacted: result.compacted,
+      removed: result.removed,
+    };
   });
 
   ipcMain.handle("thread:delete", (_event, threadId: unknown) => {

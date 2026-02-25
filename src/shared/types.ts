@@ -56,6 +56,8 @@ export interface ThreadMessage {
     taskId?: string;
     /** Optional tool input payload snapshot for richer UI rendering */
     toolArgs?: Record<string, unknown>;
+    /** Optional user-visible text when underlying sent content differs (e.g. @file mentions). */
+    userDisplayContent?: string;
   };
 }
 
@@ -132,6 +134,8 @@ export interface NewThreadInput {
 export interface SendMessageInput {
   threadId: string;
   content: string;
+  /** Optional UI display text for user bubble when content is transformed before send. */
+  displayContent?: string;
   images?: ImageAttachment[];
   /** UI permission mode for this run (maps to app-server approvals for codex provider) */
   permissionMode?: "full" | "approve";
@@ -159,6 +163,12 @@ export interface ThreadUpdateInput {
 export interface InstalledEditor {
   id: "vscode" | "cursor";
   label: string;
+}
+
+export interface ThreadCompactResult {
+  state: AppState;
+  compacted: boolean;
+  removed: number;
 }
 
 export interface AgentStatusEvent {
@@ -280,6 +290,7 @@ export interface SncodeApi {
   createThread: (payload: NewThreadInput) => Promise<Thread>;
   deleteThread: (threadId: string) => Promise<AppState>;
   updateThread: (payload: ThreadUpdateInput) => Promise<Thread | null>;
+  compactThread: (threadId: string) => Promise<ThreadCompactResult>;
   updateProvider: (payload: ProviderUpdateInput) => Promise<ProviderConfig[]>;
   updateProviderBatch: (payload: ProviderUpdateInput[]) => Promise<ProviderConfig[]>;
   setProviderCredential: (payload: ProviderCredentialInput) => Promise<ProviderConfig[]>;

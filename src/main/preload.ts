@@ -13,6 +13,7 @@ const api: SncodeApi = {
   createThread: (payload: NewThreadInput) => ipcRenderer.invoke("thread:create", payload),
   deleteThread: (threadId: string) => ipcRenderer.invoke("thread:delete", threadId),
   updateThread: (payload: ThreadUpdateInput) => ipcRenderer.invoke("thread:update", payload),
+  compactThread: (threadId: string) => ipcRenderer.invoke("thread:compact", threadId),
   updateProvider: (payload: ProviderUpdateInput) => ipcRenderer.invoke("provider:update", payload),
   updateProviderBatch: (payload: ProviderUpdateInput[]) => ipcRenderer.invoke("provider:update-batch", payload),
   setProviderCredential: (payload: ProviderCredentialInput) =>

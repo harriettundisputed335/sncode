@@ -29,6 +29,7 @@ export const imageAttachmentSchema = z.object({
 export const sendMessageInputSchema = z.object({
   threadId: z.string().trim().min(1),
   content: z.string().max(12000),
+  displayContent: z.string().max(12000).optional(),
   images: z.array(imageAttachmentSchema).max(10).optional(),
   permissionMode: z.enum(["full", "approve"]).optional(),
 }).refine(
