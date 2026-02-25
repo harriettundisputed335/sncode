@@ -2,6 +2,12 @@ import React, { FormEvent, startTransition, useCallback, useDeferredValue, useEf
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import hljs from "highlight.js/lib/core";
+import * as monacoEditor from "monaco-editor";
+import EditorWorker from "monaco-editor/esm/vs/editor/editor.worker?worker";
+import JsonWorker from "monaco-editor/esm/vs/language/json/json.worker?worker";
+import CssWorker from "monaco-editor/esm/vs/language/css/css.worker?worker";
+import HtmlWorker from "monaco-editor/esm/vs/language/html/html.worker?worker";
+import TsWorker from "monaco-editor/esm/vs/language/typescript/ts.worker?worker";
 
 // Register common languages for syntax highlighting
 import javascript from "highlight.js/lib/languages/javascript";
@@ -51,9 +57,20 @@ hljs.registerLanguage("cs", csharp);
 hljs.registerLanguage("cpp", cpp);
 hljs.registerLanguage("c", cpp);
 
-import { AgentSettings, AppState, FileTreeEntry, GitDiffEntry, GitStatusInfo, ImageAttachment, ImageMediaType, ProviderId, ProviderConfig, Project, ThinkingLevel, ThreadMessage, ThreadMessageSummary, TodoItem } from "../shared/types";
+import { AgentSettings, AppState, FileTreeEntry, GitDiffEntry, GitStatusInfo, ImageAttachment, ImageMediaType, InstalledEditor, ProviderId, ProviderConfig, Project, ThinkingLevel, ThreadMessage, ThreadMessageSummary, TodoItem } from "../shared/types";
 import { ALL_MODELS, API_KEY_URLS, labelForModelId, providerForModelId, modelEntryById, estimateCost } from "../shared/models";
 import SettingsModal from "./SettingsModal";
+
+// Monaco worker bootstrap for Vite/Electron. Prevents main-thread fallback + worker warnings.
+(self as unknown as { MonacoEnvironment?: { getWorker: (_moduleId: string, label: string) => Worker } }).MonacoEnvironment = {
+  getWorker(_moduleId: string, label: string) {
+    if (label === "json") return new JsonWorker();
+    if (label === "css" || label === "scss" || label === "less") return new CssWorker();
+    if (label === "html" || label === "handlebars" || label === "razor") return new HtmlWorker();
+    if (label === "typescript" || label === "javascript") return new TsWorker();
+    return new EditorWorker();
+  },
+};
 
 /* ── constants ── */
 
@@ -75,6 +92,9 @@ type RightSidebarState = {
   taskMsgId?: string;
 };
 type ThreadMessageMetaMap = Map<string, ThreadMessageSummary>;
+type SidebarContextMenu =
+  | { kind: "thread"; x: number; y: number; threadId: string }
+  | { kind: "project"; x: number; y: number; projectId: string; projectPath: string };
 const EMPTY_THREAD_MESSAGES: ThreadMessage[] = [];
 
 type PerfAggregate = {
@@ -91,6 +111,11 @@ type PerfTurnSnapshot = PerfAggregate & {
   threadId: string;
   startedAtMs: number;
   endedAtMs?: number;
+};
+
+type QueuedMessageDraft = {
+  content: string;
+  images?: ImageAttachment[];
 };
 
 function makeEmptyPerfAggregate(): PerfAggregate {
@@ -142,6 +167,534 @@ function estimateContextTokensForMessage(msg: ThreadMessage): number {
   let tokens = Math.ceil(msg.content.length / 4) + 8;
   if (msg.images?.length) tokens += msg.images.length * 1500;
   return tokens;
+}
+
+const CONTEXT_FALLBACK_WINDOW = 32_768;
+const CONTEXT_COMPACT_TRIGGER_RATIO = 0.92;
+const CONTEXT_COMPACT_TARGET_RATIO = 0.67;
+const CONTEXT_MIN_HISTORY_BUDGET = 256;
+const CONTEXT_SYSTEM_PROMPT_ESTIMATE = 1_600;
+
+function toChatHistory(messages: ThreadMessage[]): ThreadMessage[] {
+  return messages.filter((m) => m.role === "user" || m.role === "assistant");
+}
+
+function estimateHistoryTokens(messages: ThreadMessage[]): number {
+  let total = 0;
+  for (const msg of messages) total += estimateContextTokensForMessage(msg);
+  return total;
+}
+
+function compactHistoryTokenEstimate(
+  history: ThreadMessage[],
+  contextWindow: number,
+  reservedOutputTokens: number,
+): { compactedHistoryTokens: number; estimatedInputTokens: number; usedCompaction: boolean } {
+  const historyTokens = estimateHistoryTokens(history);
+  const triggerLimit = Math.floor(contextWindow * CONTEXT_COMPACT_TRIGGER_RATIO);
+  const targetUsage = Math.floor(contextWindow * CONTEXT_COMPACT_TARGET_RATIO);
+  const estimatedInputWithoutCompaction = CONTEXT_SYSTEM_PROMPT_ESTIMATE + historyTokens;
+  const estimatedUsage = estimatedInputWithoutCompaction + reservedOutputTokens;
+  if (estimatedUsage <= triggerLimit) {
+    return {
+      compactedHistoryTokens: historyTokens,
+      estimatedInputTokens: estimatedInputWithoutCompaction,
+      usedCompaction: false,
+    };
+  }
+  let historyBudget = targetUsage - CONTEXT_SYSTEM_PROMPT_ESTIMATE - reservedOutputTokens;
+  if (historyBudget < CONTEXT_MIN_HISTORY_BUDGET) {
+    historyBudget = contextWindow - CONTEXT_SYSTEM_PROMPT_ESTIMATE - reservedOutputTokens;
+  }
+  historyBudget = Math.max(CONTEXT_MIN_HISTORY_BUDGET, historyBudget);
+  const compactedHistoryTokens = Math.min(historyTokens, historyBudget);
+  return {
+    compactedHistoryTokens,
+    estimatedInputTokens: CONTEXT_SYSTEM_PROMPT_ESTIMATE + compactedHistoryTokens,
+    usedCompaction: true,
+  };
+}
+
+function normalizeToolName(name: string): string {
+  const idx = name.lastIndexOf("__");
+  return idx >= 0 ? name.slice(idx + 2) : name;
+}
+
+function parsePathFromToolDetail(detail: string): string | undefined {
+  const raw = detail.trim();
+  if (!raw) return undefined;
+  const pathMatch = raw.match(/(?:path|file)\s*[:=]\s*([^\s,]+)/i);
+  if (pathMatch?.[1]) return pathMatch[1];
+  const windowsPathMatch = raw.match(/[A-Za-z]:\\[^\s]+/);
+  if (windowsPathMatch?.[0]) return windowsPathMatch[0];
+  const unixPathMatch = raw.match(/(?:^|\s)([~./][^\s]+\.[A-Za-z0-9._-]+)/);
+  if (unixPathMatch?.[1]) return unixPathMatch[1];
+  const trailingPathMatch = raw.match(/:\s*([^\s]+\.[A-Za-z0-9._-]+)$/);
+  if (trailingPathMatch?.[1]) return trailingPathMatch[1];
+  return undefined;
+}
+
+function parsePathFromPatch(patch: string): string | undefined {
+  const plusMatch = patch.match(/^\+\+\+\s+(?:[ab]\/)?([^\n\r]+)/m);
+  if (plusMatch?.[1] && plusMatch[1] !== "/dev/null") return plusMatch[1].trim();
+  const diffMatch = patch.match(/^diff --git a\/([^\s]+)\s+b\/([^\s]+)/m);
+  if (diffMatch?.[2]) return diffMatch[2].trim();
+  return undefined;
+}
+
+function parsePathFromToolOutput(output: string): string | undefined {
+  const windowsPathMatch = output.match(/[A-Za-z]:\\[^\s"'`<>|?*]+?\.[A-Za-z0-9._-]+/);
+  if (windowsPathMatch?.[0]) return windowsPathMatch[0];
+  const unixPathMatch = output.match(/(?:^|\s)(\/[^\s"'`]+?\.[A-Za-z0-9._-]+)/);
+  if (unixPathMatch?.[1]) return unixPathMatch[1];
+  const relPathMatch = output.match(/(?:^|\s)([A-Za-z0-9._/-]+?\.[A-Za-z0-9._-]+)/);
+  if (relPathMatch?.[1]) return relPathMatch[1];
+  return undefined;
+}
+
+function extractPathFromToolArgs(args: Record<string, unknown>): string | undefined {
+  const directKeys = ["path", "filePath", "file_path", "relative_path"];
+  for (const key of directKeys) {
+    const raw = args[key];
+    if (typeof raw === "string" && raw.trim()) return raw.trim();
+    if (raw && typeof raw === "object") {
+      const obj = raw as Record<string, unknown>;
+      const nested = obj.path ?? obj.filePath ?? obj.file_path;
+      if (typeof nested === "string" && nested.trim()) return nested.trim();
+    }
+  }
+  return undefined;
+}
+
+function buildDiffPreviewFromPatch(patchText: string): { original: string; modified: string } | null {
+  const original: string[] = [];
+  const modified: string[] = [];
+  let sawDiffLines = false;
+  const lines = patchText.split("\n");
+
+  for (const rawLine of lines) {
+    const line = rawLine.replace(/\r$/, "");
+    const trimmed = line.trimStart();
+    if (!trimmed) {
+      original.push("");
+      modified.push("");
+      continue;
+    }
+    if (trimmed.startsWith("diff ") || trimmed.startsWith("index ") || trimmed.startsWith("--- ") || trimmed.startsWith("+++ ")) continue;
+    if (trimmed.startsWith("@@")) continue;
+
+    if (trimmed.startsWith("+")) {
+      modified.push(trimmed.slice(1));
+      sawDiffLines = true;
+      continue;
+    }
+    if (trimmed.startsWith("-")) {
+      original.push(trimmed.slice(1));
+      sawDiffLines = true;
+      continue;
+    }
+    if (trimmed.startsWith(" ")) {
+      const ctx = trimmed.slice(1);
+      original.push(ctx);
+      modified.push(ctx);
+      sawDiffLines = true;
+      continue;
+    }
+
+    // Handle diff snippets that include visual pipe prefixes (e.g. "| - line").
+    const pipeMatch = trimmed.match(/^\|+\s*([+\- ])(.*)$/);
+    if (pipeMatch) {
+      const marker = pipeMatch[1];
+      const text = pipeMatch[2] || "";
+      if (marker === "+") modified.push(text);
+      else if (marker === "-") original.push(text);
+      else {
+        original.push(text);
+        modified.push(text);
+      }
+      sawDiffLines = true;
+      continue;
+    }
+  }
+
+  if (!sawDiffLines) return null;
+  return { original: original.join("\n"), modified: modified.join("\n") };
+}
+
+const MONACO_LANGUAGE_BY_EXT: Record<string, string> = {
+  ts: "typescript",
+  tsx: "typescript",
+  js: "javascript",
+  jsx: "javascript",
+  mjs: "javascript",
+  cjs: "javascript",
+  json: "json",
+  md: "markdown",
+  py: "python",
+  rs: "rust",
+  go: "go",
+  java: "java",
+  css: "css",
+  scss: "scss",
+  html: "html",
+  xml: "xml",
+  yml: "yaml",
+  yaml: "yaml",
+  sh: "shell",
+  bash: "shell",
+  ps1: "powershell",
+  sql: "sql",
+  cs: "csharp",
+  cpp: "cpp",
+  c: "c",
+  diff: "diff",
+  patch: "diff",
+  txt: "plaintext",
+};
+
+function languageForFilePath(filePath?: string, fallback = "plaintext"): string {
+  if (!filePath) return fallback;
+  const cleanRaw = filePath.split(" -> ").at(-1) || filePath;
+  const clean = cleanRaw
+    .trim()
+    .replace(/^[`"'[\](){}]+/, "")
+    .replace(/[`"'[\](){}:,;]+$/, "");
+  const ext = clean.split(".").pop()?.toLowerCase();
+  if (!ext) return fallback;
+  return MONACO_LANGUAGE_BY_EXT[ext] || fallback;
+}
+
+let monacoThemesRegistered = false;
+
+function ensureMonacoThemes(monaco: typeof monacoEditor) {
+  if (monacoThemesRegistered) return;
+  monaco.editor.defineTheme("sncode-dark", {
+    base: "vs-dark",
+    inherit: true,
+    rules: [],
+    colors: {
+      "editor.background": "#101010",
+      "editor.foreground": "#cfcfcf",
+      "editorLineNumber.foreground": "#575757",
+      "editorLineNumber.activeForeground": "#8b8b8b",
+      "editor.selectionBackground": "#2a2a2a",
+      "editor.inactiveSelectionBackground": "#1d1d1d",
+      "editorGutter.background": "#101010",
+      "editorCursor.foreground": "#8ddca2",
+    },
+  });
+  monaco.editor.defineTheme("sncode-light", {
+    base: "vs",
+    inherit: true,
+    rules: [],
+    colors: {
+      "editor.background": "#f7f7f7",
+      "editor.foreground": "#222222",
+      "editorLineNumber.foreground": "#a3a3a3",
+      "editorLineNumber.activeForeground": "#666666",
+      "editor.selectionBackground": "#dbeafe",
+      "editor.inactiveSelectionBackground": "#e8eef6",
+      "editorGutter.background": "#f7f7f7",
+      "editorCursor.foreground": "#0f766e",
+    },
+  });
+  monacoThemesRegistered = true;
+}
+
+function activeMonacoThemeName(): "sncode-dark" | "sncode-light" {
+  return document.documentElement.getAttribute("data-theme") === "light" ? "sncode-light" : "sncode-dark";
+}
+
+function CodeEditorSurface({
+  value,
+  language,
+  height,
+  compact,
+}: {
+  value: string;
+  language: string;
+  height: number | string;
+  compact?: boolean;
+}) {
+  const hostRef = useRef<HTMLDivElement | null>(null);
+  const editorRef = useRef<monacoEditor.editor.IStandaloneCodeEditor | null>(null);
+  const modelRef = useRef<monacoEditor.editor.ITextModel | null>(null);
+
+  useEffect(() => {
+    const host = hostRef.current;
+    if (!host) return;
+    ensureMonacoThemes(monacoEditor);
+    monacoEditor.editor.setTheme(activeMonacoThemeName());
+
+    const model = monacoEditor.editor.createModel(value, language);
+    modelRef.current = model;
+    const editor = monacoEditor.editor.create(host, {
+      model,
+      readOnly: true,
+      minimap: { enabled: false },
+      glyphMargin: false,
+      folding: !compact,
+      lineNumbers: compact ? "off" : "on",
+      renderLineHighlight: "none",
+      scrollBeyondLastLine: false,
+      automaticLayout: true,
+      wordWrap: compact ? "on" : "off",
+      fontSize: compact ? 11 : 12,
+      lineHeight: compact ? 16 : 18,
+      scrollbar: { verticalScrollbarSize: compact ? 7 : 8, horizontalScrollbarSize: compact ? 7 : 8 },
+      overviewRulerBorder: false,
+    });
+    editorRef.current = editor;
+    const ro = typeof ResizeObserver !== "undefined"
+      ? new ResizeObserver(() => editor.layout())
+      : null;
+    ro?.observe(host);
+    return () => {
+      ro?.disconnect();
+      editor.dispose();
+      model.dispose();
+      editorRef.current = null;
+      modelRef.current = null;
+    };
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
+  useEffect(() => {
+    const model = modelRef.current;
+    if (!model) return;
+    monacoEditor.editor.setTheme(activeMonacoThemeName());
+    if (model.getValue() !== value) model.setValue(value);
+    if (model.getLanguageId() !== language) {
+      monacoEditor.editor.setModelLanguage(model, language);
+    }
+  }, [value, language]);
+
+  return (
+    <div
+      className="min-h-0 overflow-hidden rounded-lg border border-[var(--border-subtle)] bg-[var(--bg-input)]"
+      style={{ height: typeof height === "number" ? `${height}px` : height }}
+    ><div ref={hostRef} className="h-full w-full" /></div>
+  );
+}
+
+function DiffEditorSurface({
+  original,
+  modified,
+  language,
+  height,
+  sideBySide = true,
+  showLineNumbers = true,
+}: {
+  original: string;
+  modified: string;
+  language: string;
+  height: number | string;
+  sideBySide?: boolean;
+  showLineNumbers?: boolean;
+}) {
+  const hostRef = useRef<HTMLDivElement | null>(null);
+  const editorRef = useRef<monacoEditor.editor.IStandaloneDiffEditor | null>(null);
+  const originalModelRef = useRef<monacoEditor.editor.ITextModel | null>(null);
+  const modifiedModelRef = useRef<monacoEditor.editor.ITextModel | null>(null);
+
+  useEffect(() => {
+    const host = hostRef.current;
+    if (!host) return;
+    ensureMonacoThemes(monacoEditor);
+    monacoEditor.editor.setTheme(activeMonacoThemeName());
+
+    const originalModel = monacoEditor.editor.createModel(original, language);
+    const modifiedModel = monacoEditor.editor.createModel(modified, language);
+    originalModelRef.current = originalModel;
+    modifiedModelRef.current = modifiedModel;
+
+    const editor = monacoEditor.editor.createDiffEditor(host, {
+      readOnly: true,
+      renderSideBySide: sideBySide,
+      minimap: { enabled: false },
+      scrollBeyondLastLine: false,
+      automaticLayout: true,
+      lineNumbers: showLineNumbers ? "on" : "off",
+      wordWrap: "off",
+      fontSize: 12,
+      renderOverviewRuler: false,
+      scrollbar: { verticalScrollbarSize: 8, horizontalScrollbarSize: 8 },
+      glyphMargin: false,
+      lineDecorationsWidth: showLineNumbers ? 10 : 4,
+      hideUnchangedRegions: { enabled: false },
+    });
+    editor.setModel({ original: originalModel, modified: modifiedModel });
+    editorRef.current = editor;
+    const ro = typeof ResizeObserver !== "undefined"
+      ? new ResizeObserver(() => editor.layout())
+      : null;
+    ro?.observe(host);
+    return () => {
+      ro?.disconnect();
+      editor.setModel(null);
+      editor.dispose();
+      originalModel.dispose();
+      modifiedModel.dispose();
+      editorRef.current = null;
+      originalModelRef.current = null;
+      modifiedModelRef.current = null;
+    };
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
+  useEffect(() => {
+    monacoEditor.editor.setTheme(activeMonacoThemeName());
+    const originalModel = originalModelRef.current;
+    const modifiedModel = modifiedModelRef.current;
+    if (!originalModel || !modifiedModel) return;
+    if (originalModel.getValue() !== original) originalModel.setValue(original);
+    if (modifiedModel.getValue() !== modified) modifiedModel.setValue(modified);
+    if (originalModel.getLanguageId() !== language) {
+      monacoEditor.editor.setModelLanguage(originalModel, language);
+    }
+    if (modifiedModel.getLanguageId() !== language) {
+      monacoEditor.editor.setModelLanguage(modifiedModel, language);
+    }
+  }, [original, modified, language, sideBySide, showLineNumbers]);
+
+  useEffect(() => {
+    const editor = editorRef.current;
+    if (!editor) return;
+    editor.updateOptions({
+      renderSideBySide: sideBySide,
+      lineNumbers: showLineNumbers ? "on" : "off",
+      lineDecorationsWidth: showLineNumbers ? 10 : 4,
+    });
+  }, [sideBySide, showLineNumbers]);
+
+  return (
+    <div
+      className="min-h-0 overflow-hidden rounded-lg border border-[var(--border-subtle)] bg-[var(--bg-input)]"
+      style={{ height: typeof height === "number" ? `${height}px` : height }}
+    ><div ref={hostRef} className="h-full w-full" /></div>
+  );
+}
+
+type ToolCodePreview =
+  | { kind: "single"; language: string; value: string; title?: string }
+  | { kind: "diff"; language: string; original: string; modified: string; title?: string };
+
+function clamp(n: number, min: number, max: number): number {
+  return Math.max(min, Math.min(max, n));
+}
+
+function lineCountOf(text: string): number {
+  if (!text) return 1;
+  return text.split("\n").length;
+}
+
+function codePreviewLineCount(preview: ToolCodePreview): number {
+  if (preview.kind === "single") return lineCountOf(preview.value);
+  return Math.max(lineCountOf(preview.original), lineCountOf(preview.modified));
+}
+
+function codePreviewHeights(preview: ToolCodePreview): { collapsed: number; expanded: number; truncatedInCollapsed: boolean } {
+  const lines = codePreviewLineCount(preview);
+  const collapsedBase = preview.kind === "single" ? 48 : 64;
+  const expandedBase = preview.kind === "single" ? 56 : 74;
+  const collapsed = clamp(collapsedBase + lines * 18, 120, 260);
+  const expanded = clamp(expandedBase + lines * 20, 180, 560);
+  return { collapsed, expanded, truncatedInCollapsed: expanded > collapsed + 16 };
+}
+
+function toolCodePreviewForMessage(msg: ThreadMessage): ToolCodePreview | null {
+  const rawToolName = msg.metadata?.toolName || "tool";
+  const toolName = normalizeToolName(rawToolName);
+  const detail = msg.metadata?.toolDetail || "";
+  const toolArgs = msg.metadata?.toolArgs;
+  if (!toolArgs || typeof toolArgs !== "object") {
+    if (toolName === "edit_file" || toolName === "apply_patch") {
+      const parsedFallback = buildDiffPreviewFromPatch(msg.content);
+      const pathFromFallback = parsePathFromToolDetail(detail) || parsePathFromPatch(msg.content) || parsePathFromToolOutput(msg.content);
+      if (parsedFallback) {
+        return {
+          kind: "diff",
+          language: languageForFilePath(pathFromFallback, "plaintext"),
+          original: parsedFallback.original,
+          modified: parsedFallback.modified,
+          title: pathFromFallback || "Patch",
+        };
+      }
+    }
+    if ((toolName === "edit_file" || toolName === "apply_patch") && /(^|\n)[+-][^\n]/.test(msg.content)) {
+      return {
+        kind: "single",
+        language: "diff",
+        value: msg.content,
+        title: parsePathFromToolDetail(detail) || "Patch",
+      };
+    }
+    return null;
+  }
+  const args = toolArgs as Record<string, unknown>;
+  const pathFromArgs = extractPathFromToolArgs(args);
+  const pathFromPatchArg = typeof args.patch === "string" ? parsePathFromPatch(args.patch) : undefined;
+  const resolvedPath = pathFromArgs || pathFromPatchArg || parsePathFromToolDetail(detail) || parsePathFromToolOutput(msg.content);
+  if (toolName === "write_file") {
+    const content = typeof args.content === "string" ? args.content : "";
+    if (!content) return null;
+    return {
+      kind: "single",
+      language: languageForFilePath(resolvedPath),
+      value: content,
+      title: resolvedPath,
+    };
+  }
+  if (toolName === "edit_file") {
+    const oldText = typeof args.old_string === "string" ? args.old_string : "";
+    const newText = typeof args.new_string === "string" ? args.new_string : "";
+    const patchText = typeof args.patch === "string" ? args.patch : "";
+    if (!oldText && !newText) {
+      if (!patchText) return null;
+      const parsed = buildDiffPreviewFromPatch(patchText);
+      if (parsed) {
+        return {
+          kind: "diff",
+          language: languageForFilePath(resolvedPath, "plaintext"),
+          original: parsed.original,
+          modified: parsed.modified,
+          title: resolvedPath,
+        };
+      }
+      return {
+        kind: "single",
+        language: "diff",
+        value: patchText,
+        title: resolvedPath,
+      };
+    }
+    return {
+      kind: "diff",
+      language: languageForFilePath(resolvedPath),
+      original: oldText,
+      modified: newText,
+      title: resolvedPath,
+    };
+  }
+  if (toolName === "apply_patch") {
+    const patch = typeof args.patch === "string" ? args.patch : "";
+    if (!patch) return null;
+    const parsed = buildDiffPreviewFromPatch(patch);
+    if (parsed) {
+      return {
+        kind: "diff",
+        language: languageForFilePath(resolvedPath, "plaintext"),
+        original: parsed.original,
+        modified: parsed.modified,
+        title: resolvedPath || "Patch",
+      };
+    }
+    return {
+      kind: "single",
+      language: "diff",
+      value: patch,
+      title: resolvedPath || "Patch",
+    };
+  }
+  return null;
 }
 
 function estimatePayloadBytes(payload: unknown): number {
@@ -268,12 +821,26 @@ const ToolMessage = React.memo(function ToolMessage({ msg }: { msg: ThreadMessag
   const name = msg.metadata?.toolName || "tool";
   const detail = msg.metadata?.toolDetail || name;
   const detailDisplay = useMemo(() => formatToolDetailForDisplay(name, detail), [name, detail]);
+  const codePreview = useMemo(() => toolCodePreviewForMessage(msg), [msg]);
+  const previewHeights = useMemo(
+    () => (codePreview ? codePreviewHeights(codePreview) : null),
+    [codePreview]
+  );
   const pending = msg.metadata?.pending === true;
   const result = msg.content;
   const previewChars = name === "run_command" ? 120 : 200;
   const isLong = result.length > previewChars;
   const isHeavyOutput = name === "run_command" && result.length > 6000;
+  const normalizedToolName = normalizeToolName(name);
+  const suppressExpandedRawResult = (normalizedToolName === "edit_file" || normalizedToolName === "apply_patch") && !!codePreview;
+  const hasExpandableRaw = !codePreview && isLong;
+  const hasExpandablePreview = !!previewHeights && previewHeights.truncatedInCollapsed;
+  const canExpand = !pending && (hasExpandablePreview || hasExpandableRaw);
   const [renderExpandedContent, setRenderExpandedContent] = useState(false);
+
+  useEffect(() => {
+    if (!canExpand && expanded) setExpanded(false);
+  }, [canExpand, expanded]);
 
   useEffect(() => {
     if (!expanded || !result) {
@@ -300,7 +867,7 @@ const ToolMessage = React.memo(function ToolMessage({ msg }: { msg: ThreadMessag
 
   const dotColor = pending
     ? "bg-amber-400/80 animate-pulse"
-    : name === "write_file" || name === "edit_file"
+    : name === "write_file" || name === "edit_file" || normalizeToolName(name) === "apply_patch"
       ? "bg-emerald-500/70"
       : name === "run_command"
         ? "bg-amber-400/70"
@@ -311,8 +878,8 @@ const ToolMessage = React.memo(function ToolMessage({ msg }: { msg: ThreadMessag
   return (
     <div className={`rounded-lg border border-[var(--border-subtle)] bg-[var(--bg-base)] ${pending ? "opacity-80" : ""}`}>
       <button
-        onClick={() => !pending && setExpanded((v) => !v)}
-        className="flex w-full items-center gap-2 px-3.5 py-2 text-left"
+        onClick={() => canExpand && setExpanded((v) => !v)}
+        className={`flex w-full items-center gap-2 px-3.5 py-2 text-left ${canExpand ? "" : "cursor-default"}`}
         title={detail}
       >
         <div className={`h-1.5 w-1.5 shrink-0 rounded-full ${dotColor}`} />
@@ -324,7 +891,7 @@ const ToolMessage = React.memo(function ToolMessage({ msg }: { msg: ThreadMessag
         >
           {pending ? `${detailDisplay.text}...` : detailDisplay.text}
         </span>
-        {!pending && (
+        {canExpand && (
           <svg
             width="10" height="10" viewBox="0 0 10 10" fill="currentColor"
             className={`shrink-0 text-[var(--text-dimmer)] transition-transform ${expanded ? "rotate-180" : ""}`}
@@ -333,20 +900,67 @@ const ToolMessage = React.memo(function ToolMessage({ msg }: { msg: ThreadMessag
           </svg>
         )}
       </button>
-      {!pending && (expanded || !isLong) && result && (
-        <div className="border-t border-[var(--border-subtle)] px-3.5 py-2.5">
-          {(name === "edit_file") && result.startsWith("Replaced") ? (
-            <div className="flex items-center gap-1.5 text-[11px] text-emerald-500/70">
-              <svg width="11" height="11" viewBox="0 0 12 12" fill="none"><path d="M2.5 6l2.5 2.5 4.5-5" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" strokeLinejoin="round" /></svg>
-              {result}
-            </div>
-          ) : expanded && isHeavyOutput && !renderExpandedContent ? (
-            <div className="py-1 text-[11px] text-[var(--text-dimmer)]">Rendering output…</div>
+
+      {!pending && codePreview && !expanded && (
+        <div className="border-t border-[var(--border-subtle)] px-2.5 py-2">
+          {codePreview.kind === "single" ? (
+            <CodeEditorSurface value={codePreview.value} language={codePreview.language} height={previewHeights?.collapsed ?? 130} compact />
           ) : (
-            <pre className="max-h-[300px] overflow-auto whitespace-pre-wrap font-mono text-[11px] leading-relaxed text-[var(--text-dim)]">
-              {isLong && !expanded ? result.slice(0, previewChars) + "..." : result}
-            </pre>
+            <DiffEditorSurface
+              original={codePreview.original}
+              modified={codePreview.modified}
+              language={codePreview.language}
+              height={previewHeights?.collapsed ?? 170}
+              sideBySide={false}
+              showLineNumbers={false}
+            />
           )}
+        </div>
+      )}
+
+      {!pending && expanded && canExpand && (
+        <div className="border-t border-[var(--border-subtle)] px-3.5 py-2.5">
+          {codePreview && (
+            <div className="mb-2.5">
+              {codePreview.title && (
+                <div className="mb-1 text-[10px] text-[var(--text-dimmer)]">{codePreview.title}</div>
+              )}
+              {codePreview.kind === "single" ? (
+                <CodeEditorSurface value={codePreview.value} language={codePreview.language} height={previewHeights?.expanded ?? 320} />
+              ) : (
+                <DiffEditorSurface
+                  original={codePreview.original}
+                  modified={codePreview.modified}
+                  language={codePreview.language}
+                  height={previewHeights?.expanded ?? 380}
+                  sideBySide={false}
+                  showLineNumbers={false}
+                />
+              )}
+            </div>
+          )}
+          {!suppressExpandedRawResult && result && (
+            (normalizedToolName === "edit_file") && result.startsWith("Replaced") ? (
+              <div className="flex items-center gap-1.5 text-[11px] text-emerald-500/70">
+                <svg width="11" height="11" viewBox="0 0 12 12" fill="none"><path d="M2.5 6l2.5 2.5 4.5-5" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" strokeLinejoin="round" /></svg>
+                {result}
+              </div>
+            ) : isHeavyOutput && !renderExpandedContent ? (
+              <div className="py-1 text-[11px] text-[var(--text-dimmer)]">Rendering output...</div>
+            ) : (
+              <pre className="max-h-[300px] overflow-auto whitespace-pre-wrap font-mono text-[11px] leading-relaxed text-[var(--text-dim)]">
+                {result}
+              </pre>
+            )
+          )}
+        </div>
+      )}
+
+      {!pending && !expanded && !codePreview && !isLong && result && (
+        <div className="border-t border-[var(--border-subtle)] px-3.5 py-2.5">
+          <pre className="max-h-[300px] overflow-auto whitespace-pre-wrap font-mono text-[11px] leading-relaxed text-[var(--text-dim)]">
+            {result}
+          </pre>
         </div>
       )}
     </div>
@@ -354,7 +968,6 @@ const ToolMessage = React.memo(function ToolMessage({ msg }: { msg: ThreadMessag
 });
 
 /* ── Task message component ── */
-
 function formatDuration(ms: number): string {
   if (ms < 1000) return `${ms}ms`;
   const s = Math.round(ms / 1000);
@@ -691,6 +1304,9 @@ function estimateMessageRowHeight(msg: ThreadMessage): number {
       const base = msg.metadata?.pending ? 72 : 120;
       return Math.min(320, base + Math.ceil(msg.content.length / 220) * 18);
     }
+    const toolName = normalizeToolName(msg.metadata?.toolName || "");
+    const hasCodePreview = !!msg.metadata?.toolArgs && (toolName === "write_file" || toolName === "edit_file" || toolName === "apply_patch");
+    if (hasCodePreview) return msg.metadata?.pending ? 60 : 180;
     if (msg.metadata?.pending) return 44;
     return Math.min(260, 48 + Math.ceil(msg.content.length / 180) * 16);
   }
@@ -983,6 +1599,34 @@ function GitBranchIcon() {
   );
 }
 
+function QueueIcon() {
+  return (
+    <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M5 7h11" />
+      <path d="M5 12h11" />
+      <path d="M5 17h7" />
+      <path d="M19 14v6" />
+      <path d="M16 17h6" />
+    </svg>
+  );
+}
+
+function VSCodeIcon() {
+  return (
+    <svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor" className="text-blue-400">
+      <path d="M16.6 2.1 7.6 10 4.7 7.8 2 9.7l3.3 3L2 16.1l2.7 1.9 2.9-2.2 9 7.9 5.4-2.1V4.2z" />
+    </svg>
+  );
+}
+
+function CursorIcon() {
+  return (
+    <svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor" className="text-emerald-400">
+      <path d="M4 3h10l6 6v10H10l-6-6z" />
+    </svg>
+  );
+}
+
 function TrashIcon() {
   return (
     <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
@@ -1119,12 +1763,16 @@ function SearchBar({ messages, onClose, onHighlight }: { messages: ThreadMessage
     if (!query.trim()) return [];
     const q = query.toLowerCase();
     return messages
-      .filter((m) => (m.role === "user" || m.role === "assistant") && m.content.toLowerCase().includes(q))
+      .filter((m) => {
+        if (m.content.toLowerCase().includes(q)) return true;
+        return Boolean(m.metadata?.toolDetail?.toLowerCase().includes(q));
+      })
       .map((m) => {
-        const idx = m.content.toLowerCase().indexOf(q);
+        const src = m.content || m.metadata?.toolDetail || "";
+        const idx = src.toLowerCase().indexOf(q);
         const start = Math.max(0, idx - 40);
-        const end = Math.min(m.content.length, idx + query.length + 40);
-        const snippet = (start > 0 ? "..." : "") + m.content.slice(start, end) + (end < m.content.length ? "..." : "");
+        const end = Math.min(src.length, idx + query.length + 40);
+        const snippet = (start > 0 ? "..." : "") + src.slice(start, end) + (end < src.length ? "..." : "");
         return { id: m.id, role: m.role, snippet, time: m.createdAt };
       });
   }, [query, messages]);
@@ -1179,7 +1827,7 @@ function HighlightText({ text, query }: { text: string; query: string }) {
   return (
     <>
       {parts.map((part, i) =>
-        regex.test(part) ? (
+        i % 2 === 1 ? (
           <mark key={i} className="rounded bg-amber-400/30 text-amber-200 px-0.5">{part}</mark>
         ) : (
           <span key={i}>{part}</span>
@@ -1259,18 +1907,8 @@ function DiffViewer({ oldContent, newContent }: { oldContent: string; newContent
 /* ── Right Sidebar Components ── */
 
 function RightSidebarFileView({ filePath, content, onClose }: { filePath: string; content: string; onClose: () => void }) {
-  const ext = filePath.split(".").pop()?.toLowerCase() || "";
   const isError = content.startsWith("Error:");
-  let highlighted = content;
-  if (!isError) {
-    try {
-      if (ext && hljs.getLanguage(ext)) {
-        highlighted = hljs.highlight(content, { language: ext }).value;
-      } else {
-        highlighted = hljs.highlightAuto(content).value;
-      }
-    } catch { /* use raw */ }
-  }
+  const language = languageForFilePath(filePath);
 
   return (
     <div className="flex h-full flex-col">
@@ -1280,32 +1918,88 @@ function RightSidebarFileView({ filePath, content, onClose }: { filePath: string
         <button onClick={onClose} className="grid h-7 w-7 place-items-center rounded-lg text-[var(--text-dim)] transition hover:bg-[var(--bg-hover)] hover:text-[var(--text-muted)]"><XIcon /></button>
       </div>
       <div className="h-px bg-[var(--divider)]" />
-      <div className="min-h-0 flex-1 overflow-auto">
+      <div className="min-h-0 flex-1 overflow-hidden p-3">
         {isError ? (
-          <div className="p-5 text-[12px] text-red-400">{content}</div>
+          <div className="p-2 text-[12px] text-red-400">{content}</div>
         ) : (
-          <pre className="p-4 text-[12px] leading-relaxed text-[var(--text-secondary)]">
-            <code dangerouslySetInnerHTML={{ __html: highlighted }} />
-          </pre>
+          <CodeEditorSurface value={content} language={language} height="100%" />
         )}
       </div>
     </div>
   );
 }
 
-/** Build a tree of changed files grouped by directory */
-function buildDiffTree(diffs: GitDiffEntry[]): Array<{ dir: string; files: GitDiffEntry[] }> {
-  const dirMap = new Map<string, GitDiffEntry[]>();
-  for (const d of diffs) {
-    const slash = d.file.lastIndexOf("/");
-    const dir = slash >= 0 ? d.file.slice(0, slash) : ".";
-    if (!dirMap.has(dir)) dirMap.set(dir, []);
-    dirMap.get(dir)!.push(d);
+type DiffTreeNode = {
+  id: string;
+  kind: "dir" | "file";
+  name: string;
+  path: string;
+  children?: DiffTreeNode[];
+  diff?: GitDiffEntry;
+};
+
+type MutableDiffTreeDir = {
+  id: string;
+  kind: "dir";
+  name: string;
+  path: string;
+  children: Map<string, MutableDiffTreeDir | DiffTreeNode>;
+};
+
+function diffDisplayPath(file: string): string {
+  const normalized = file.replace(/\\/g, "/").trim();
+  if (!normalized) return file;
+  const renameIdx = normalized.indexOf(" -> ");
+  if (renameIdx >= 0) return normalized.slice(renameIdx + 4).trim();
+  return normalized;
+}
+
+function buildDiffTree(diffs: GitDiffEntry[]): DiffTreeNode[] {
+  const root: MutableDiffTreeDir = { id: "dir:/", kind: "dir", name: "/", path: "", children: new Map() };
+
+  for (const diff of diffs) {
+    const displayPath = diffDisplayPath(diff.file);
+    const parts = displayPath.split("/").filter(Boolean);
+    if (parts.length === 0) continue;
+
+    let current = root;
+    let accum = "";
+    for (let i = 0; i < parts.length - 1; i++) {
+      const part = parts[i];
+      accum = accum ? `${accum}/${part}` : part;
+      const key = `dir:${accum}`;
+      const existing = current.children.get(key);
+      if (existing && existing.kind === "dir") {
+        current = existing as MutableDiffTreeDir;
+        continue;
+      }
+      const nextDir: MutableDiffTreeDir = { id: key, kind: "dir", name: part, path: accum, children: new Map() };
+      current.children.set(key, nextDir);
+      current = nextDir;
+    }
+
+    const fileName = parts[parts.length - 1];
+    const filePath = accum ? `${accum}/${fileName}` : fileName;
+    const fileNode: DiffTreeNode = { id: `file:${diff.file}`, kind: "file", name: fileName, path: filePath, diff };
+    current.children.set(fileNode.id, fileNode);
   }
-  // Sort dirs: root first, then alphabetical
-  return Array.from(dirMap.entries())
-    .sort(([a], [b]) => { if (a === ".") return -1; if (b === ".") return 1; return a.localeCompare(b); })
-    .map(([dir, files]) => ({ dir, files: files.sort((a, b) => a.file.localeCompare(b.file)) }));
+
+  const toImmutable = (dir: MutableDiffTreeDir): DiffTreeNode[] => {
+    const nodes = Array.from(dir.children.values()).map((entry) => {
+      if (entry.kind === "dir") {
+        const sub = entry as MutableDiffTreeDir;
+        return { id: sub.id, kind: "dir", name: sub.name, path: sub.path, children: toImmutable(sub) } as DiffTreeNode;
+      }
+      return entry as DiffTreeNode;
+    });
+    nodes.sort((a, b) => {
+      if (a.kind !== b.kind) return a.kind === "dir" ? -1 : 1;
+      return a.name.localeCompare(b.name);
+    });
+    return nodes;
+  };
+
+  return toImmutable(root);
 }
 
 function DiffStatusBadge({ status }: { status: string }) {
@@ -1323,10 +2017,9 @@ function DiffStatusBadge({ status }: { status: string }) {
   );
 }
 
-/** Parse diff hunk header like @@ -10,6 +12,8 @@ to extract line numbers */
-function parseDiffLines(diff: string): Array<{ type: "header" | "add" | "remove" | "context" | "meta"; content: string; oldLine?: number; newLine?: number }> {
+function parseDiffLines(diff: string): Array<{ type: "header" | "add" | "remove" | "context"; content: string; oldLine?: number; newLine?: number }> {
   const lines = diff.split("\n");
-  const result: Array<{ type: "header" | "add" | "remove" | "context" | "meta"; content: string; oldLine?: number; newLine?: number }> = [];
+  const result: Array<{ type: "header" | "add" | "remove" | "context"; content: string; oldLine?: number; newLine?: number }> = [];
   let oldLine = 0;
   let newLine = 0;
 
@@ -1339,7 +2032,7 @@ function parseDiffLines(diff: string): Array<{ type: "header" | "add" | "remove"
         result.push({ type: "header", content: match[3]?.trim() || "" });
       }
     } else if (line.startsWith("+++") || line.startsWith("---") || line.startsWith("diff ") || line.startsWith("index ")) {
-      // Skip meta lines
+      continue;
     } else if (line.startsWith("+")) {
       result.push({ type: "add", content: line.slice(1), newLine });
       newLine++;
@@ -1352,31 +2045,82 @@ function parseDiffLines(diff: string): Array<{ type: "header" | "add" | "remove"
       newLine++;
     }
   }
+
   return result;
 }
 
 function RightSidebarDiffView({ diffs, onClose }: { diffs: GitDiffEntry[]; onClose: () => void }) {
+  const tree = useMemo(() => buildDiffTree(diffs), [diffs]);
   const [selectedFile, setSelectedFile] = useState<string | null>(diffs[0]?.file ?? null);
   const [collapsedDirs, setCollapsedDirs] = useState<Set<string>>(new Set());
+
+  useEffect(() => {
+    if (!selectedFile || !diffs.some((d) => d.file === selectedFile)) {
+      setSelectedFile(diffs[0]?.file ?? null);
+    }
+  }, [diffs, selectedFile]);
+
   const activeDiff = diffs.find((d) => d.file === selectedFile);
-  const tree = useMemo(() => buildDiffTree(diffs), [diffs]);
-
-  const toggleDir = (dir: string) => {
-    setCollapsedDirs((prev) => { const next = new Set(prev); if (next.has(dir)) next.delete(dir); else next.add(dir); return next; });
-  };
-
-  const fileName = (path: string) => { const i = path.lastIndexOf("/"); return i >= 0 ? path.slice(i + 1) : path; };
-
   const diffLines = useMemo(() => activeDiff?.diff ? parseDiffLines(activeDiff.diff) : [], [activeDiff]);
 
-  // Count additions/deletions
   const addCount = diffs.filter((d) => d.status === "added" || d.status === "untracked").length;
   const modCount = diffs.filter((d) => d.status === "modified").length;
   const delCount = diffs.filter((d) => d.status === "deleted").length;
 
+  const toggleDir = (dirId: string) => {
+    setCollapsedDirs((prev) => {
+      const next = new Set(prev);
+      if (next.has(dirId)) next.delete(dirId);
+      else next.add(dirId);
+      return next;
+    });
+  };
+
+  const renderTree = (nodes: DiffTreeNode[], depth: number): React.ReactNode => nodes.map((node) => {
+    const baseIndent = 10 + depth * 14;
+    if (node.kind === "dir") {
+      const open = !collapsedDirs.has(node.id);
+      return (
+        <div key={node.id}>
+          <button
+            onClick={() => toggleDir(node.id)}
+            className="flex w-full items-center gap-1.5 py-[5px] pr-2 text-left text-[10px] text-[var(--text-dim)] transition hover:bg-[var(--bg-card)]"
+            style={{ paddingLeft: `${baseIndent}px` }}
+          >
+            <svg width="6" height="6" viewBox="0 0 6 6" fill="currentColor" className={`shrink-0 text-[var(--text-dimmer)] transition-transform ${open ? "rotate-90" : ""}`}>
+              <path d="M1.5 0.5l3 2.5-3 2.5z" />
+            </svg>
+            <FolderIcon open={open} />
+            <span className="min-w-0 flex-1 truncate font-medium">{node.name}</span>
+          </button>
+          {open && node.children ? renderTree(node.children, depth + 1) : null}
+        </div>
+      );
+    }
+
+    const diffEntry = node.diff;
+    if (!diffEntry) return null;
+    const active = diffEntry.file === selectedFile;
+    return (
+      <button
+        key={node.id}
+        onClick={() => setSelectedFile(diffEntry.file)}
+        className={`flex w-full items-center gap-2 py-[4px] pr-2 text-left text-[11px] transition ${active ? "bg-[var(--bg-elevated)] text-[var(--text-primary)]" : "text-[var(--text-muted)] hover:bg-[var(--bg-card)] hover:text-[var(--text-secondary)]"}`}
+        style={{ paddingLeft: `${baseIndent + 10}px` }}
+      >
+        <DiffStatusBadge status={diffEntry.status} />
+        <FileIcon name={node.name} />
+        <span className="min-w-0 truncate">{node.name}</span>
+      </button>
+    );
+  });
+
+  const displayPath = activeDiff ? diffDisplayPath(activeDiff.file) : "";
+  const diffLanguage = languageForFilePath(displayPath, "plaintext");
+  const hasEditorDiff = !!activeDiff && activeDiff.beforeContent !== undefined && activeDiff.afterContent !== undefined;
+
   return (
     <div className="flex h-full flex-col">
-      {/* Header */}
       <div className="flex items-center gap-3 px-5 py-3.5">
         <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="shrink-0 text-[var(--text-muted)]">
           <path d="M6 3v12" /><circle cx="18" cy="6" r="3" /><circle cx="6" cy="18" r="3" /><path d="M18 9a9 9 0 0 1-9 9" />
@@ -1401,91 +2145,60 @@ function RightSidebarDiffView({ diffs, onClose }: { diffs: GitDiffEntry[]; onClo
         </div>
       ) : (
         <div className="flex min-h-0 flex-1 flex-col">
-          {/* File tree */}
-          <div className="shrink-0 overflow-auto border-b border-[var(--border-subtle)]" style={{ maxHeight: "40%" }}>
-            {tree.map(({ dir, files }) => (
-              <div key={dir}>
-                {/* Directory header */}
-                {dir !== "." && (
-                  <button
-                    onClick={() => toggleDir(dir)}
-                    className="flex w-full items-center gap-1.5 px-2.5 py-[5px] text-left text-[10px] text-[var(--text-dim)] transition hover:bg-[var(--bg-card)]"
-                  >
-                    <svg width="6" height="6" viewBox="0 0 6 6" fill="currentColor" className={`shrink-0 text-[var(--text-dimmer)] transition-transform ${collapsedDirs.has(dir) ? "" : "rotate-90"}`}>
-                      <path d="M1.5 0.5l3 2.5-3 2.5z" />
-                    </svg>
-                    <FolderIcon open={!collapsedDirs.has(dir)} />
-                    <span className="truncate font-medium">{dir}</span>
-                    <span className="ml-auto text-[9px] text-[var(--text-dimmer)]">{files.length}</span>
-                  </button>
-                )}
-                {/* Files in this directory */}
-                {!collapsedDirs.has(dir) && files.map((d) => (
-                  <button
-                    key={d.file}
-                    onClick={() => setSelectedFile(d.file)}
-                    className={`flex w-full items-center gap-2 py-[4px] text-left text-[11px] transition ${
-                      dir === "." ? "px-2.5" : "pl-7 pr-2.5"
-                    } ${d.file === selectedFile ? "bg-[var(--bg-elevated)] text-[var(--text-primary)]" : "text-[var(--text-muted)] hover:bg-[var(--bg-card)] hover:text-[var(--text-secondary)]"}`}
-                  >
-                    <DiffStatusBadge status={d.status} />
-                    <FileIcon name={fileName(d.file)} />
-                    <span className="min-w-0 truncate">{fileName(d.file)}</span>
-                  </button>
-                ))}
-              </div>
-            ))}
+          <div className="shrink-0 overflow-auto border-b border-[var(--border-subtle)]" style={{ maxHeight: "42%" }}>
+            {renderTree(tree, 0)}
           </div>
 
-          {/* Diff content */}
-          <div className="min-h-0 flex-1 overflow-auto bg-[var(--bg-input)]">
+          <div className="min-h-0 flex flex-1 flex-col overflow-hidden bg-[var(--bg-input)]">
             {activeDiff ? (
               <>
-                {/* File header bar */}
-                <div className="sticky top-0 z-10 flex items-center gap-2 border-b border-[var(--border-subtle)] bg-[var(--bg-surface)] px-3 py-1.5">
-                  <FileIcon name={fileName(activeDiff.file)} />
-                  <span className="min-w-0 truncate text-[11px] text-[var(--text-label)]">{activeDiff.file}</span>
+                <div className="flex items-center gap-2 border-b border-[var(--border-subtle)] bg-[var(--bg-surface)] px-3 py-1.5">
+                  <FileIcon name={displayPath} />
+                  <span className="min-w-0 truncate text-[11px] text-[var(--text-label)]">{displayPath}</span>
                   <DiffStatusBadge status={activeDiff.status} />
                 </div>
-                {/* Diff lines */}
-                {diffLines.length > 0 ? (
-                  <div className="font-mono text-[11px] leading-[18px]">
-                    {diffLines.map((line, i) => {
-                      if (line.type === "header") {
+
+                <div className="min-h-0 flex-1 overflow-hidden p-3">
+                  {hasEditorDiff ? (
+                    <DiffEditorSurface
+                      original={activeDiff.beforeContent ?? ""}
+                      modified={activeDiff.afterContent ?? ""}
+                      language={diffLanguage}
+                      height="100%"
+                    />
+                  ) : diffLines.length > 0 ? (
+                    <div className="h-full overflow-auto font-mono text-[11px] leading-[18px]">
+                      {diffLines.map((line, i) => {
+                        if (line.type === "header") {
+                          return (
+                            <div key={i} className="flex items-center border-y border-[var(--border-subtle)] bg-[var(--bg-diff-header)]/60 px-3 py-1 text-[10px] text-blue-400/60 italic">
+                              <span>{line.content || "..."}</span>
+                            </div>
+                          );
+                        }
+                        const bgCls = line.type === "add" ? "bg-emerald-500/8" : line.type === "remove" ? "bg-red-500/8" : "";
+                        const textCls = line.type === "add" ? "text-emerald-300/80" : line.type === "remove" ? "text-red-300/80" : "text-[var(--text-dim)]";
+                        const gutterCls = line.type === "add" ? "text-emerald-500/40" : line.type === "remove" ? "text-red-500/40" : "text-[var(--text-dimmest)]";
+                        const marker = line.type === "add" ? "+" : line.type === "remove" ? "-" : " ";
+                        const markerCls = line.type === "add" ? "text-emerald-400/60" : line.type === "remove" ? "text-red-400/60" : "text-transparent";
                         return (
-                          <div key={i} className="flex items-center border-y border-[var(--border-subtle)] bg-[var(--bg-diff-header)]/60 px-3 py-1 text-[10px] text-blue-400/60 italic">
-                            <span>{line.content || "..."}</span>
+                          <div key={i} className={`flex ${bgCls}`}>
+                            <span className={`w-[38px] shrink-0 select-none border-r border-[var(--border-subtle)] pr-1 text-right text-[10px] leading-[18px] ${gutterCls}`}>
+                              {line.type !== "add" ? line.oldLine : ""}
+                            </span>
+                            <span className={`w-[38px] shrink-0 select-none border-r border-[var(--border-subtle)] pr-1 text-right text-[10px] leading-[18px] ${gutterCls}`}>
+                              {line.type !== "remove" ? line.newLine : ""}
+                            </span>
+                            <span className={`w-4 shrink-0 select-none text-center ${markerCls}`}>{marker}</span>
+                            <span className={`min-w-0 flex-1 whitespace-pre-wrap break-all pr-2 ${textCls}`}>{line.content || " "}</span>
                           </div>
                         );
-                      }
-                      const bgCls = line.type === "add" ? "bg-emerald-500/8" : line.type === "remove" ? "bg-red-500/8" : "";
-                      const textCls = line.type === "add" ? "text-emerald-300/80" : line.type === "remove" ? "text-red-300/80" : "text-[var(--text-dim)]";
-                      const gutterCls = line.type === "add" ? "text-emerald-500/40" : line.type === "remove" ? "text-red-500/40" : "text-[var(--text-dimmest)]";
-                      const marker = line.type === "add" ? "+" : line.type === "remove" ? "-" : " ";
-                      const markerCls = line.type === "add" ? "text-emerald-400/60" : line.type === "remove" ? "text-red-400/60" : "text-transparent";
-                      return (
-                        <div key={i} className={`flex ${bgCls}`}>
-                          <span className={`w-[38px] shrink-0 select-none border-r border-[var(--border-subtle)] pr-1 text-right text-[10px] leading-[18px] ${gutterCls}`}>
-                            {line.type !== "add" ? line.oldLine : ""}
-                          </span>
-                          <span className={`w-[38px] shrink-0 select-none border-r border-[var(--border-subtle)] pr-1 text-right text-[10px] leading-[18px] ${gutterCls}`}>
-                            {line.type !== "remove" ? line.newLine : ""}
-                          </span>
-                          <span className={`w-4 shrink-0 select-none text-center ${markerCls}`}>{marker}</span>
-                          <span className={`min-w-0 flex-1 whitespace-pre-wrap break-all pr-2 ${textCls}`}>{line.content || " "}</span>
-                        </div>
-                      );
-                    })}
-                  </div>
-                ) : (
-                  <div className="p-4 text-center text-[11px] text-[var(--text-dim)]">
-                    {activeDiff.status === "untracked" ? (
-                      <pre className="whitespace-pre-wrap text-left text-[var(--text-dim)]">{activeDiff.diff || "(empty file)"}</pre>
-                    ) : (
-                      "No diff available"
-                    )}
-                  </div>
-                )}
+                      })}
+                    </div>
+                  ) : (
+                    <div className="p-4 text-center text-[11px] text-[var(--text-dim)]">No diff available</div>
+                  )}
+                </div>
               </>
             ) : (
               <div className="flex h-full items-center justify-center text-[12px] text-[var(--text-dimmer)]">Select a file to view changes</div>
@@ -1496,7 +2209,6 @@ function RightSidebarDiffView({ diffs, onClose }: { diffs: GitDiffEntry[]; onClo
     </div>
   );
 }
-
 function RightSidebarSubAgent({ msg, onClose }: { msg: ThreadMessage; onClose: () => void }) {
   const pending = msg.metadata?.pending === true;
   const taskType = msg.metadata?.taskType || "general";
@@ -2217,6 +2929,8 @@ const ComposerPanel = React.memo(function ComposerPanel({
   thinkingProvider,
   updateThinkingLevel,
   isBusy,
+  queuedDraft,
+  onClearQueued,
   onCancel,
   selThreadId,
 }: {
@@ -2243,12 +2957,15 @@ const ComposerPanel = React.memo(function ComposerPanel({
   thinkingProvider: ProviderId;
   updateThinkingLevel: (level: ThinkingLevel) => void;
   isBusy: boolean;
+  queuedDraft?: QueuedMessageDraft;
+  onClearQueued: () => void;
   onCancel: () => Promise<void>;
   selThreadId: string | null;
 }) {
   const available = useMemo(() => availableModels(providers), [providers]);
   const activeLabel = useMemo(() => activeModelLabel(providers), [providers]);
   const activeId = useMemo(() => activeModelId(providers), [providers]);
+  const canQueue = msgInput.trim().length > 0 || pendingImages.length > 0;
 
   return (
     <div className="shrink-0 px-4 pb-4 pt-1">
@@ -2268,6 +2985,16 @@ const ComposerPanel = React.memo(function ComposerPanel({
             }
           }}
         >
+          {queuedDraft && (
+            <div className="flex items-center gap-2 border-b border-[var(--border-subtle)] px-3.5 py-1.5 text-[11px] text-amber-400">
+              <span className="inline-flex h-1.5 w-1.5 rounded-full bg-amber-400/90" />
+              <span className="flex-1 truncate">
+                Queued next: {queuedDraft.content || `${queuedDraft.images?.length ?? 0} image${(queuedDraft.images?.length ?? 0) === 1 ? "" : "s"}`}
+              </span>
+              <button type="button" onClick={onClearQueued} className="text-[var(--text-dim)] transition hover:text-[var(--text-muted)]">Clear</button>
+            </div>
+          )}
+
           {pendingImages.length > 0 && (
             <div className="flex flex-wrap gap-2 px-3.5 pt-2.5">
               {pendingImages.map((img, i) => (
@@ -2365,7 +3092,14 @@ const ComposerPanel = React.memo(function ComposerPanel({
             />
             <div className="ml-auto">
               {isBusy ? (
-                <button type="button" onClick={() => { void onCancel(); }} className="grid h-8 w-8 place-items-center rounded-full bg-[var(--bg-stop)] text-[var(--text-primary)] transition hover:bg-[var(--bg-stop-hover)]" title="Stop"><StopIcon /></button>
+                <div className="flex items-center gap-1.5">
+                  {canQueue && (
+                    <button type="submit" className="grid h-8 w-8 place-items-center rounded-full bg-amber-500 text-black transition hover:bg-amber-400" title="Queue next message">
+                      <QueueIcon />
+                    </button>
+                  )}
+                  <button type="button" onClick={() => { void onCancel(); }} className="grid h-8 w-8 place-items-center rounded-full bg-red-600 text-white transition hover:bg-red-500" title="Stop"><StopIcon /></button>
+                </div>
               ) : (
                 <button type="submit" disabled={!selThreadId || (!msgInput.trim() && pendingImages.length === 0)} className="grid h-8 w-8 place-items-center rounded-full bg-[var(--bg-accent)] text-[var(--text-on-accent)] transition hover:bg-[var(--bg-accent-hover)] disabled:opacity-20"><SendIcon /></button>
               )}
@@ -2386,6 +3120,7 @@ const ComposerPanel = React.memo(function ComposerPanel({
   prev.thinkingLevel === next.thinkingLevel &&
   prev.thinkingProvider === next.thinkingProvider &&
   prev.isBusy === next.isBusy &&
+  prev.queuedDraft === next.queuedDraft &&
   prev.selThreadId === next.selThreadId
 ));
 
@@ -2407,7 +3142,9 @@ const SidebarPanel = React.memo(function SidebarPanel({
   setShowFileTree,
   onAddThread,
   onDeleteThread,
+  onDeleteProject,
   onAddProject,
+  onOpenProjectInExplorer,
   onOpenFileInSidebar,
 }: {
   projects: Project[];
@@ -2417,17 +3154,19 @@ const SidebarPanel = React.memo(function SidebarPanel({
   expandedProjects: Set<string>;
   runningThreads: Set<string>;
   threadMessageMeta: ThreadMessageMetaMap;
-  contextMenu: { x: number; y: number; threadId: string } | null;
+  contextMenu: SidebarContextMenu | null;
   showFileTree: boolean;
   setShowSettings: React.Dispatch<React.SetStateAction<boolean>>;
   setExpandedProjects: React.Dispatch<React.SetStateAction<Set<string>>>;
   setSelProjectId: React.Dispatch<React.SetStateAction<string | null>>;
   setSelThreadId: React.Dispatch<React.SetStateAction<string | null>>;
-  setContextMenu: React.Dispatch<React.SetStateAction<{ x: number; y: number; threadId: string } | null>>;
+  setContextMenu: React.Dispatch<React.SetStateAction<SidebarContextMenu | null>>;
   setShowFileTree: React.Dispatch<React.SetStateAction<boolean>>;
   onAddThread: (project: Project) => Promise<void>;
   onDeleteThread: (threadId: string) => Promise<void>;
+  onDeleteProject: (projectId: string) => Promise<void>;
   onAddProject: () => Promise<void>;
+  onOpenProjectInExplorer: (projectPath: string) => Promise<void>;
   onOpenFileInSidebar: (relativePath: string) => Promise<void>;
 }) {
   return (
@@ -2459,6 +3198,10 @@ const SidebarPanel = React.memo(function SidebarPanel({
                   });
                   setSelProjectId(project.id);
                 }}
+                onContextMenu={(ev) => {
+                  ev.preventDefault();
+                  setContextMenu({ kind: "project", x: ev.clientX, y: ev.clientY, projectId: project.id, projectPath: project.folderPath });
+                }}
                 className="group flex w-full items-center gap-1.5 rounded-lg px-2.5 py-[6px] text-left transition hover:bg-[var(--bg-card)]"
               >
                 <svg width="9" height="9" viewBox="0 0 10 10" fill="currentColor" className={`shrink-0 text-[var(--text-dimmer)] transition-transform ${expanded ? "rotate-90" : ""}`}><path d="M3 1l4 4-4 4z" /></svg>
@@ -2476,7 +3219,7 @@ const SidebarPanel = React.memo(function SidebarPanel({
                           onClick={() => { setSelProjectId(project.id); setSelThreadId(thread.id); }}
                           onContextMenu={(ev) => {
                             ev.preventDefault();
-                            setContextMenu({ x: ev.clientX, y: ev.clientY, threadId: thread.id });
+                            setContextMenu({ kind: "thread", x: ev.clientX, y: ev.clientY, threadId: thread.id });
                           }}
                           className={`flex w-full items-center justify-between rounded-lg px-2.5 py-[6px] pr-7 text-left text-[13px] transition ${active ? "bg-[var(--bg-elevated)] text-[var(--text-primary)]" : "text-[var(--text-muted)] hover:bg-[var(--bg-card)] hover:text-[var(--text-label)]"}`}
                         >
@@ -2532,13 +3275,33 @@ const SidebarPanel = React.memo(function SidebarPanel({
             className="fixed z-50 min-w-[140px] overflow-hidden rounded-lg border border-[var(--border-strong)] bg-[var(--bg-elevated)] py-1 shadow-xl shadow-black/50"
             style={{ left: contextMenu.x, top: contextMenu.y }}
           >
-            <button
-              onClick={() => { void onDeleteThread(contextMenu.threadId); setContextMenu(null); }}
-              className="flex w-full items-center gap-2 px-3 py-[6px] text-left text-[12px] text-red-400 transition hover:bg-[var(--bg-active)]"
-            >
-              <TrashIcon />
-              Delete thread
-            </button>
+            {contextMenu.kind === "thread" ? (
+              <button
+                onClick={() => { void onDeleteThread(contextMenu.threadId); setContextMenu(null); }}
+                className="flex w-full items-center gap-2 px-3 py-[6px] text-left text-[12px] text-red-400 transition hover:bg-[var(--bg-active)]"
+              >
+                <TrashIcon />
+                Delete thread
+              </button>
+            ) : (
+              <>
+                <button
+                  onClick={() => { void onOpenProjectInExplorer(contextMenu.projectPath); setContextMenu(null); }}
+                  className="flex w-full items-center gap-2 px-3 py-[6px] text-left text-[12px] text-[var(--text-label)] transition hover:bg-[var(--bg-active)]"
+                >
+                  <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M3 7h5l2 2h11v10a2 2 0 0 1-2 2H3z" /><path d="M3 7V5a2 2 0 0 1 2-2h4" /></svg>
+                  Open in Explorer
+                </button>
+                <div className="mx-2 my-1 h-px bg-[var(--bg-active)]" />
+                <button
+                  onClick={() => { void onDeleteProject(contextMenu.projectId); setContextMenu(null); }}
+                  className="flex w-full items-center gap-2 px-3 py-[6px] text-left text-[12px] text-red-400 transition hover:bg-[var(--bg-active)]"
+                >
+                  <TrashIcon />
+                  Remove project
+                </button>
+              </>
+            )}
           </div>
         </>
       )}
@@ -2572,16 +3335,20 @@ export default function App() {
   const [dragOver, setDragOver] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
-  const [contextMenu, setContextMenu] = useState<{ x: number; y: number; threadId: string } | null>(null);
+  const [contextMenu, setContextMenu] = useState<SidebarContextMenu | null>(null);
   const [showFileTree, setShowFileTree] = useState(false);
   const [showSearch, setShowSearch] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
   const [showModelPicker, setShowModelPicker] = useState(false);
+  const [showEditorPicker, setShowEditorPicker] = useState(false);
   const [permission, setPermission] = useState<PermissionMode>("full");
   const [showBranchDropdown, setShowBranchDropdown] = useState(false);
   const [gitBranches, setGitBranches] = useState<string[]>([]);
   const [currentBranch, setCurrentBranch] = useState("");
   const [gitStatus, setGitStatus] = useState<GitStatusInfo>({ changes: 0, staged: 0, isRepo: false });
+  const [installedEditors, setInstalledEditors] = useState<InstalledEditor[]>([]);
+  const [preferredEditorId, setPreferredEditorId] = useState<InstalledEditor["id"]>("vscode");
+  const [queuedMessagesByThread, setQueuedMessagesByThread] = useState<Record<string, QueuedMessageDraft>>({});
   // Right sidebar state — subagent uses msgId for live reactivity (reads from state.messages)
   const [rightSidebar, setRightSidebar] = useState<RightSidebarState | null>(null);
   // Git actions dropdown
@@ -2617,6 +3384,10 @@ export default function App() {
   const renderStartRef = useRef(0);
   const perfGlobalRef = useRef<PerfAggregate>(makeEmptyPerfAggregate());
   const perfActiveTurnRef = useRef<PerfTurnSnapshot | null>(null);
+  const selThreadIdRef = useRef<string | null>(null);
+  const permissionRef = useRef<PermissionMode>("full");
+  const queuedMessagesRef = useRef<Record<string, QueuedMessageDraft>>({});
+  const activeModelIdRef = useRef("");
 
   renderStartRef.current = performance.now();
 
@@ -2631,6 +3402,22 @@ export default function App() {
   }, [theme]);
 
   useEffect(() => {
+    selThreadIdRef.current = selThreadId;
+  }, [selThreadId]);
+
+  useEffect(() => {
+    permissionRef.current = permission;
+  }, [permission]);
+
+  useEffect(() => {
+    queuedMessagesRef.current = queuedMessagesByThread;
+  }, [queuedMessagesByThread]);
+
+  useEffect(() => {
+    activeModelIdRef.current = activeModelId(state.providers);
+  }, [state.providers]);
+
+  useEffect(() => {
     try {
       const rendererEnabled = window.localStorage.getItem("sncode.perf.renderer") === "1";
       const perfPanelEnabled = window.localStorage.getItem("sncode.perf.panel") === "1";
@@ -2641,6 +3428,33 @@ export default function App() {
       togglePerfPanel(false);
     }
   }, []);
+
+  useEffect(() => {
+    try {
+      const stored = window.localStorage.getItem("sncode.preferred.editor");
+      if (stored === "vscode" || stored === "cursor") {
+        setPreferredEditorId(stored);
+      }
+    } catch {
+      // ignore storage errors
+    }
+    void window.sncode.getInstalledEditors().then((editors) => {
+      setInstalledEditors(editors);
+      if (editors.length === 0) return;
+      setPreferredEditorId((current) => {
+        const hasCurrent = editors.some((e) => e.id === current);
+        return hasCurrent ? current : editors[0].id;
+      });
+    });
+  }, []);
+
+  useEffect(() => {
+    try {
+      window.localStorage.setItem("sncode.preferred.editor", preferredEditorId);
+    } catch {
+      // ignore storage errors
+    }
+  }, [preferredEditorId]);
 
   const selProject = useMemo(() => state.projects.find((p) => p.id === selProjectId) ?? null, [state.projects, selProjectId]);
   const selThread = useMemo(() => state.threads.find((t) => t.id === selThreadId) ?? null, [state.threads, selThreadId]);
@@ -2663,28 +3477,68 @@ export default function App() {
 
   // Comprehensive thread stats: tokens, tool calls, context, pricing
   const threadStats = useMemo(() => {
-    let inputTokens = 0, outputTokens = 0, toolCalls = 0, userMsgs = 0, assistantMsgs = 0;
-    let contextInputTokens = 0;
+    let inputTokens = 0;
+    let outputTokens = 0;
+    let toolCalls = 0;
+    let userMsgs = 0;
+    let assistantMsgs = 0;
+    let observedLatestInputTokens = 0;
     for (const m of threadMessages) {
       if (m.metadata?.inputTokens) inputTokens += m.metadata.inputTokens;
       if (m.metadata?.outputTokens) outputTokens += m.metadata.outputTokens;
+      if (m.role === "assistant" && (m.metadata?.inputTokens ?? 0) > 0) {
+        observedLatestInputTokens = m.metadata?.inputTokens ?? observedLatestInputTokens;
+      }
       if (m.metadata?.toolName) toolCalls++;
       if (m.role === "user") userMsgs++;
       if (m.role === "assistant" && !m.metadata?.toolName) assistantMsgs++;
-      contextInputTokens += estimateContextTokensForMessage(m);
     }
-    const totalTokens = inputTokens + outputTokens;
+
     // Get active model for pricing + context window
     const activeProvider = state.providers.find((p) => p.enabled);
-    const modelId = activeProvider?.model || "";
+    const modelId = selThread?.lastModel || activeProvider?.model || "";
     const modelEntry = modelEntryById(modelId);
-    const contextWindow = modelEntry?.contextWindow || 200_000;
+    const contextWindow = modelEntry?.contextWindow || CONTEXT_FALLBACK_WINDOW;
     const reservedOutputTokens = state.settings.maxTokens || 0;
-    const contextTokens = contextInputTokens + reservedOutputTokens;
+    const history = toChatHistory(threadMessages);
+    const historyInputTokens = estimateHistoryTokens(history);
+    const compactEstimate = compactHistoryTokenEstimate(history, contextWindow, reservedOutputTokens);
+    const estimatedInputTokens = Math.max(observedLatestInputTokens, compactEstimate.estimatedInputTokens);
+    const contextTokens = estimatedInputTokens + reservedOutputTokens;
     const contextPct = contextWindow > 0 ? Math.min(100, Math.round((contextTokens / contextWindow) * 100)) : 0;
     const cost = estimateCost(modelId, inputTokens, outputTokens);
-    return { inputTokens, outputTokens, totalTokens, toolCalls, userMsgs, assistantMsgs, contextTokens, contextWindow, contextPct, cost, modelId };
-  }, [threadMessages, state.providers, state.settings.maxTokens]);
+    const displayInputTokens = inputTokens > 0 ? inputTokens : historyInputTokens;
+    const totalTokens = displayInputTokens + outputTokens;
+    return {
+      inputTokens,
+      outputTokens,
+      displayInputTokens,
+      totalTokens,
+      toolCalls,
+      userMsgs,
+      assistantMsgs,
+      contextTokens,
+      contextWindow,
+      contextPct,
+      cost,
+      modelId,
+      observedLatestInputTokens,
+      estimatedInputTokens,
+      usedCompaction: compactEstimate.usedCompaction,
+      historyInputTokens,
+    };
+  }, [threadMessages, state.providers, state.settings.maxTokens, selThread?.lastModel]);
+
+  useEffect(() => {
+    const targetModel = selThread?.lastModel;
+    if (!targetModel) return;
+    const activeModel = activeModelIdRef.current;
+    if (activeModel === targetModel) return;
+    const available = availableModels(state.providers);
+    if (!available.some((m) => m.id === targetModel)) return;
+    void pickModel(targetModel, { persistThreadModel: false });
+  }, [selThread?.id, selThread?.lastModel, state.providers]); // eslint-disable-line react-hooks/exhaustive-deps
+
   const liveRightSidebarTaskMsg = useMemo(() => {
     if (!rightSidebar || rightSidebar.type !== "subagent" || !rightSidebar.taskMsgId) return undefined;
     return messageById.get(rightSidebar.taskMsgId);
@@ -2739,10 +3593,12 @@ export default function App() {
       }
       setBooting(false);
     });
-  }, []);
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Agent events - status tracked globally, chunks/messages only for selected thread
   useEffect(() => {
+    const pendingUpdates = pendingMessageUpdatesRef.current;
+
     const flushStreamChunk = () => {
       streamChunkRafRef.current = null;
       const buffered = streamChunkBufferRef.current;
@@ -2755,7 +3611,7 @@ export default function App() {
 
     const flushPendingMessageUpdates = () => {
       messageUpdatesRafRef.current = null;
-      const queued = pendingMessageUpdatesRef.current;
+      const queued = pendingUpdates;
       if (queued.size === 0) return;
       const updates = Array.from(queued.values());
       queued.clear();
@@ -2810,6 +3666,7 @@ export default function App() {
       });
       if (e.status !== "running") {
         finishPerfTurn(e.threadId);
+        void flushQueuedMessageForThread(e.threadId);
       }
       if (e.threadId === selThreadId) {
         setStatusText(e.detail);
@@ -2841,7 +3698,7 @@ export default function App() {
     });
     const off4 = window.sncode.on("agent:message", (e) => {
       if (e.threadId !== selThreadId) return;
-      pendingMessageUpdatesRef.current.set(e.message.id, e.message);
+      pendingUpdates.set(e.message.id, e.message);
       if (messageUpdatesRafRef.current === null) {
         messageUpdatesRafRef.current = requestAnimationFrame(flushPendingMessageUpdates);
       }
@@ -2857,7 +3714,7 @@ export default function App() {
         cancelAnimationFrame(messageUpdatesRafRef.current);
         messageUpdatesRafRef.current = null;
       }
-      pendingMessageUpdatesRef.current.clear();
+      pendingUpdates.clear();
       if (streamChunkRafRef.current !== null) {
         cancelAnimationFrame(streamChunkRafRef.current);
         streamChunkRafRef.current = null;
@@ -2865,7 +3722,7 @@ export default function App() {
       streamChunkBufferRef.current = "";
       off1(); off2(); off3(); off4();
     };
-  }, [selThreadId]);
+  }, [selThreadId]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // When switching threads: clear stale stream state and refresh messages from store
   useEffect(() => {
@@ -2983,11 +3840,12 @@ export default function App() {
       if (e.key === "Escape") {
         if (showSearch) { setShowSearch(false); setSearchHighlight(""); }
         if (contextMenu) setContextMenu(null);
+        if (showEditorPicker) setShowEditorPicker(false);
       }
     }
     window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);
-  }, [selProject, selThreadId, showSearch, contextMenu]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [selProject, selThreadId, showSearch, contextMenu, showEditorPicker]); // eslint-disable-line react-hooks/exhaustive-deps
 
   /* ── actions ── */
 
@@ -3056,10 +3914,19 @@ export default function App() {
   }
 
   function applyStateWithoutMessages(next: AppState) {
+    const validThreadIds = new Set(next.threads.map((t) => t.id));
     setState((prev) => {
-      const validThreadIds = new Set(next.threads.map((t) => t.id));
       const retainedMessages = prev.messages.filter((m) => validThreadIds.has(m.threadId));
       return { ...next, messages: retainedMessages };
+    });
+    setQueuedMessagesByThread((prev) => {
+      let changed = false;
+      const filtered: Record<string, QueuedMessageDraft> = {};
+      for (const [threadId, draft] of Object.entries(prev)) {
+        if (validThreadIds.has(threadId)) filtered[threadId] = draft;
+        else changed = true;
+      }
+      return changed ? filtered : prev;
     });
   }
 
@@ -3091,7 +3958,11 @@ export default function App() {
     if (!folder) return;
     const name = folder.split(/[\\/]/).pop() || "Project";
     const proj = await window.sncode.createProject({ name, folderPath: folder });
-    await window.sncode.createThread({ projectId: proj.id, title: "New thread" });
+    const thread = await window.sncode.createThread({ projectId: proj.id, title: "New thread" });
+    const modelId = activeModelId(state.providers);
+    if (modelId) {
+      await window.sncode.updateThread({ threadId: thread.id, lastModel: modelId });
+    }
     const next = await refresh();
     setSelProjectId(proj.id);
     setExpandedProjects((prev) => new Set(prev).add(proj.id));
@@ -3100,8 +3971,48 @@ export default function App() {
 
   async function addThread(project: Project) {
     const t = await window.sncode.createThread({ projectId: project.id, title: "New thread" });
+    const modelId = activeModelId(state.providers);
+    if (modelId) {
+      await window.sncode.updateThread({ threadId: t.id, lastModel: modelId });
+    }
     await refresh();
     setSelThreadId(t.id);
+  }
+
+  async function deleteProject(projectId: string) {
+    const next = await window.sncode.deleteProject(projectId);
+    trackIpcPayload(next);
+    applyStateWithoutMessages(next);
+    void refreshThreadMessageMeta();
+    setExpandedProjects((prev) => new Set([...prev].filter((id) => next.projects.some((p) => p.id === id))));
+    if (selProjectId === projectId) {
+      const nextProject = next.projects[0] ?? null;
+      setSelProjectId(nextProject?.id ?? null);
+      setSelThreadId(nextProject ? (next.threads.find((t) => t.projectId === nextProject.id)?.id ?? null) : null);
+      setRightSidebar(null);
+      return;
+    }
+    if (selThreadId && !next.threads.some((t) => t.id === selThreadId)) {
+      setSelThreadId(null);
+    }
+  }
+
+  async function openProjectInExplorer(projectPath: string) {
+    const res = await window.sncode.openProjectInExplorer(projectPath);
+    if (!res.success) {
+      setStatusText(res.message || "Failed to open project folder");
+      window.setTimeout(() => setStatusText("Idle"), 2500);
+    }
+  }
+
+  async function openProjectInEditor(editorId: InstalledEditor["id"]) {
+    if (!selProject) return;
+    setPreferredEditorId(editorId);
+    const res = await window.sncode.openProjectInEditor(selProject.folderPath, editorId);
+    if (!res.success) {
+      setStatusText(res.message || "Failed to open project in editor");
+      window.setTimeout(() => setStatusText("Idle"), 3000);
+    }
   }
 
   async function deleteThread(threadId: string) {
@@ -3125,7 +4036,7 @@ export default function App() {
     setState((prev) => ({ ...prev, providers }));
   }
 
-  async function pickModel(modelId: string) {
+  async function pickModel(modelId: string, options?: { persistThreadModel?: boolean }) {
     setShowModelPicker(false);
     const targetProvider = providerForModelId(modelId);
     if (!targetProvider) return;
@@ -3138,39 +4049,112 @@ export default function App() {
     if (batch.length === 0) return;
     const providers = await window.sncode.updateProviderBatch(batch);
     setState((prev) => ({ ...prev, providers }));
+    if ((options?.persistThreadModel ?? true) && selThreadId) {
+      void window.sncode.updateThread({ threadId: selThreadId, lastModel: modelId });
+      setState((prev) => ({
+        ...prev,
+        threads: prev.threads.map((thread) => (thread.id === selThreadId ? { ...thread, lastModel: modelId } : thread)),
+      }));
+    }
+  }
+
+  function queueMessageForThread(threadId: string, draft: QueuedMessageDraft) {
+    const next = { ...queuedMessagesRef.current, [threadId]: draft };
+    queuedMessagesRef.current = next;
+    setQueuedMessagesByThread(next);
+  }
+
+  function clearQueuedMessageForThread(threadId: string) {
+    if (!queuedMessagesRef.current[threadId]) return;
+    const next = { ...queuedMessagesRef.current };
+    delete next[threadId];
+    queuedMessagesRef.current = next;
+    setQueuedMessagesByThread(next);
+  }
+
+  async function sendPayload(
+    threadId: string,
+    draft: QueuedMessageDraft,
+    options?: { fromQueue?: boolean }
+  ): Promise<boolean> {
+    const content = draft.content.trim();
+    const images = draft.images && draft.images.length > 0 ? [...draft.images] : undefined;
+    if (!content && (!images || images.length === 0)) return false;
+
+    if (!options?.fromQueue) {
+      setMsgInput("");
+      setPendingImages([]);
+    }
+
+    startPerfTurn(threadId);
+    setRunningThreads((prev) => new Set(prev).add(threadId));
+    if (selThreadIdRef.current === threadId) {
+      setStatusText("Running");
+      setStreamChunk("");
+      isNearBottomRef.current = true;
+    }
+
+    const activeModel = activeModelId(state.providers);
+    if (activeModel) {
+      void window.sncode.updateThread({ threadId, lastModel: activeModel });
+      setState((prev) => ({
+        ...prev,
+        threads: prev.threads.map((thread) => (thread.id === threadId ? { ...thread, lastModel: activeModel } : thread)),
+      }));
+    }
+
+    try {
+      const next = await window.sncode.sendMessage({
+        threadId,
+        content,
+        images,
+        permissionMode: permissionRef.current,
+      });
+      trackIpcPayload(next, threadId);
+      applyStateWithoutMessages(next);
+      if (selThreadIdRef.current === threadId) {
+        void refreshThreadMessages(threadId);
+      }
+      void refreshThreadMessageMeta();
+      return true;
+    } catch {
+      finishPerfTurn(threadId);
+      setRunningThreads((prev) => {
+        const next = new Set(prev);
+        next.delete(threadId);
+        return next;
+      });
+      if (selThreadIdRef.current === threadId) setStatusText("Error sending message");
+      return false;
+    }
+  }
+
+  async function flushQueuedMessageForThread(threadId: string) {
+    const queued = queuedMessagesRef.current[threadId];
+    if (!queued) return;
+    clearQueuedMessageForThread(threadId);
+    await sendPayload(threadId, queued, { fromQueue: true });
   }
 
   async function send(e: FormEvent) {
     e.preventDefault();
     const hasText = msgInput.trim().length > 0;
     const hasImages = pendingImages.length > 0;
-    if (!selThreadId || (!hasText && !hasImages) || isBusy) return;
-    const content = msgInput.trim();
-    const images = pendingImages.length > 0 ? [...pendingImages] : undefined;
-    startPerfTurn(selThreadId);
-    setMsgInput("");
-    setPendingImages([]);
-    setRunningThreads((prev) => new Set(prev).add(selThreadId));
-    setStatusText("Running");
-    setStreamChunk("");
-    // Snap to bottom when user sends a message
-    isNearBottomRef.current = true;
-    try {
-      const next = await window.sncode.sendMessage({
-        threadId: selThreadId,
-        content,
-        images,
-        permissionMode: permission,
-      });
-      trackIpcPayload(next, selThreadId);
-      applyStateWithoutMessages(next);
-      void refreshThreadMessages(selThreadId);
-      void refreshThreadMessageMeta();
-    } catch {
-      finishPerfTurn(selThreadId);
-      setRunningThreads((prev) => { const next = new Set(prev); next.delete(selThreadId!); return next; });
-      setStatusText("Error sending message");
+    if (!selThreadId || (!hasText && !hasImages)) return;
+    const draft: QueuedMessageDraft = {
+      content: msgInput.trim(),
+      images: pendingImages.length > 0 ? [...pendingImages] : undefined,
+    };
+
+    if (isBusy) {
+      queueMessageForThread(selThreadId, draft);
+      setMsgInput("");
+      setPendingImages([]);
+      setStatusText("Queued next message");
+      return;
     }
+
+    await sendPayload(selThreadId, draft);
   }
 
   async function cancel() {
@@ -3284,6 +4268,7 @@ export default function App() {
   const perfLastDurationMs = lastPerfTurn?.endedAtMs && lastPerfTurn.startedAtMs
     ? Math.max(0, lastPerfTurn.endedAtMs - lastPerfTurn.startedAtMs)
     : 0;
+  const preferredEditor = installedEditors.find((editor) => editor.id === preferredEditorId) ?? installedEditors[0];
 
   return (
     <div className="flex h-screen text-[var(--text-primary)]" style={{ background: "var(--bg-base)" }}>
@@ -3307,7 +4292,9 @@ export default function App() {
         setShowFileTree={setShowFileTree}
         onAddThread={addThread}
         onDeleteThread={deleteThread}
+        onDeleteProject={deleteProject}
         onAddProject={addProject}
+        onOpenProjectInExplorer={openProjectInExplorer}
         onOpenFileInSidebar={openFileInSidebar}
       />
 
@@ -3324,6 +4311,47 @@ export default function App() {
             </div>
             <div className="no-drag flex shrink-0 items-center gap-1.5">
               <button onClick={() => setShowSearch((v) => !v)} className="grid h-7 w-7 place-items-center rounded-md text-[var(--text-dim)] transition hover:bg-[var(--bg-user-bubble)] hover:text-[var(--text-muted)]" title="Search (Ctrl+F)"><SearchIcon /></button>
+              {selProject && preferredEditor && (
+                <div className="relative">
+                  <div className="flex items-center overflow-hidden rounded-md border border-[var(--border-subtle)]">
+                    <button
+                      onClick={() => { void openProjectInEditor(preferredEditor.id); }}
+                      className="flex h-7 items-center gap-1.5 px-2 text-[11px] text-[var(--text-dim)] transition hover:bg-[var(--bg-user-bubble)] hover:text-[var(--text-muted)]"
+                      title={`Open in ${preferredEditor.label}`}
+                    >
+                      {preferredEditor.id === "vscode" ? <VSCodeIcon /> : <CursorIcon />}
+                      <span className="hidden md:inline">{preferredEditor.label}</span>
+                    </button>
+                    <button
+                      onClick={() => setShowEditorPicker((v) => !v)}
+                      className="grid h-7 w-6 place-items-center border-l border-[var(--border-subtle)] text-[var(--text-dim)] transition hover:bg-[var(--bg-user-bubble)] hover:text-[var(--text-muted)]"
+                      title="Choose editor"
+                    >
+                      <ChevronIcon open={showEditorPicker} />
+                    </button>
+                  </div>
+                  {showEditorPicker && (
+                    <>
+                      <div className="fixed inset-0 z-10" onClick={() => setShowEditorPicker(false)} />
+                      <div className="absolute right-0 top-full z-20 mt-1 min-w-[150px] overflow-hidden rounded-lg border border-[var(--border-strong)] bg-[var(--bg-elevated)] py-1 shadow-xl shadow-black/40">
+                        {installedEditors.map((editor) => (
+                          <button
+                            key={editor.id}
+                            onClick={() => {
+                              setPreferredEditorId(editor.id);
+                              setShowEditorPicker(false);
+                            }}
+                            className={`flex w-full items-center gap-2 px-3 py-[6px] text-left text-[11px] transition hover:bg-[var(--bg-active)] ${editor.id === preferredEditor.id ? "text-[var(--text-primary)]" : "text-[var(--text-muted)]"}`}
+                          >
+                            {editor.id === "vscode" ? <VSCodeIcon /> : <CursorIcon />}
+                            <span>{editor.label}</span>
+                          </button>
+                        ))}
+                      </div>
+                    </>
+                  )}
+                </div>
+              )}
 
               {selProject && gitStatus.isRepo ? (
                 <>
@@ -3466,15 +4494,23 @@ export default function App() {
             thinkingProvider={state.providers.find((p) => p.enabled)?.id ?? "anthropic"}
             updateThinkingLevel={(level) => { void updateSettings({ thinkingLevel: level }); }}
             isBusy={isBusy}
+            queuedDraft={selThreadId ? queuedMessagesByThread[selThreadId] : undefined}
+            onClearQueued={() => {
+              if (!selThreadId) return;
+              clearQueuedMessageForThread(selThreadId);
+            }}
             onCancel={cancel}
             selThreadId={selThreadId}
           />
 
           {/* ─── Bottom stats bar ─── */}
-          {threadStats.totalTokens > 0 && (
+          {threadMessages.length > 0 && (
             <div className="flex shrink-0 items-center gap-3 border-t border-[var(--border)] px-4 py-1.5">
               {/* Context usage bar */}
-              <div className="flex items-center gap-1.5" title={`Estimated context (input + max output reserve): ~${threadStats.contextTokens.toLocaleString()} / ${threadStats.contextWindow.toLocaleString()} tokens`}>
+              <div
+                className="flex items-center gap-1.5"
+                title={`Estimated request context: ~${threadStats.contextTokens.toLocaleString()} / ${threadStats.contextWindow.toLocaleString()} tokens${threadStats.observedLatestInputTokens > 0 ? ` | last observed prompt: ${threadStats.observedLatestInputTokens.toLocaleString()}` : ""}${threadStats.usedCompaction ? " | compacted history estimate applied" : ""}`}
+              >
                 <span className="text-[10px] text-[var(--text-dimmest)]">CTX</span>
                 <div className="h-1.5 w-16 overflow-hidden rounded-full bg-[var(--bg-active)]">
                   <div
@@ -3488,10 +4524,10 @@ export default function App() {
               <div className="h-3 w-px bg-[var(--bg-active)]" />
 
               {/* Token counts */}
-              <div className="flex items-center gap-1" title={`Input: ${threadStats.inputTokens.toLocaleString()} | Output: ${threadStats.outputTokens.toLocaleString()}`}>
+              <div className="flex items-center gap-1" title={`Input: ${threadStats.displayInputTokens.toLocaleString()} | Output: ${threadStats.outputTokens.toLocaleString()}${threadStats.inputTokens === 0 ? " (input estimated from chat history)" : ""}`}>
                 <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="text-[var(--text-dimmest)]"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>
                 <span className="text-[10px] text-[var(--text-dimmest)]">
-                  <span className="text-[var(--text-dimmer)]">{threadStats.inputTokens.toLocaleString()}</span>
+                  <span className="text-[var(--text-dimmer)]">{threadStats.displayInputTokens.toLocaleString()}</span>
                   <span className="mx-0.5">/</span>
                   <span className="text-[var(--text-dimmer)]">{threadStats.outputTokens.toLocaleString()}</span>
                   <span className="ml-0.5">tok</span>
@@ -3526,7 +4562,7 @@ export default function App() {
               )}
 
               {/* OAuth free indicator for Codex */}
-              {threadStats.totalTokens > 0 && threadStats.cost === 0 && modelEntryById(threadStats.modelId)?.provider === "codex" && (
+              {(threadStats.inputTokens > 0 || threadStats.outputTokens > 0) && threadStats.cost === 0 && modelEntryById(threadStats.modelId)?.provider === "codex" && (
                 <>
                   <div className="h-3 w-px bg-[var(--bg-active)]" />
                   <span className="text-[10px] text-emerald-500">free (subscription)</span>
@@ -3669,4 +4705,6 @@ export default function App() {
     </div>
   );
 }
+
+
 
