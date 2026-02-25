@@ -71,3 +71,26 @@ jobs:
 
       - name: Build
         run: npm run build
+
+  build-linux-arm64:
+    name: Build (linux-arm64)
+    runs-on: ubuntu-24.04-arm
+    needs: lint-typecheck-test
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y libsecret-1-dev
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build
+        run: npm run build
