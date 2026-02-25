@@ -115,8 +115,20 @@ type PerfTurnSnapshot = PerfAggregate & {
 
 type QueuedMessageDraft = {
   content: string;
+  displayContent?: string;
   images?: ImageAttachment[];
 };
+
+type ComposerCommand = {
+  id: "compact";
+  trigger: "/compact";
+  label: string;
+  description: string;
+};
+
+const COMPOSER_COMMANDS: ComposerCommand[] = [
+  { id: "compact", trigger: "/compact", label: "compact", description: "Compact current thread history now" },
+];
 
 function makeEmptyPerfAggregate(): PerfAggregate {
   return {
@@ -1210,6 +1222,7 @@ const ChatMessageRow = React.memo(function ChatMessageRow({
 
   if (isUser) {
     const canCopy = msg.content.trim().length > 0;
+    const userDisplayContent = msg.metadata?.userDisplayContent || msg.content;
     const onCopy = async () => {
       if (!canCopy) return;
       try {
@@ -1259,9 +1272,9 @@ const ChatMessageRow = React.memo(function ChatMessageRow({
                 ))}
               </div>
             )}
-            {msg.content && (
+            {userDisplayContent && (
               <pre className="whitespace-pre-wrap font-sans text-[13px] leading-relaxed text-[var(--text-bright)]">
-                {searchHighlight ? <HighlightText text={msg.content} query={searchHighlight} /> : msg.content}
+                {searchHighlight ? <HighlightText text={userDisplayContent} query={searchHighlight} /> : userDisplayContent}
               </pre>
             )}
           </div>
@@ -1597,6 +1610,41 @@ function GitBranchIcon() {
       <line x1="6" y1="3" x2="6" y2="15" /><circle cx="18" cy="6" r="3" /><circle cx="6" cy="18" r="3" /><path d="M18 9a9 9 0 0 1-9 9" />
     </svg>
   );
+}
+
+function flattenFileTreeEntries(entries: FileTreeEntry[], parent = ""): string[] {
+  const out: string[] = [];
+  for (const entry of entries) {
+    const rel = parent ? `${parent}/${entry.name}` : entry.name;
+    if (entry.type === "file") {
+      out.push(rel.replace(/\\/g, "/"));
+      continue;
+    }
+    if (entry.children && entry.children.length > 0) {
+      out.push(...flattenFileTreeEntries(entry.children, rel));
+    }
+  }
+  return out;
+}
+
+function escapeRegex(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function resolveMentionContent(content: string, mentions: Record<string, string>): { transformed: string; usedMentions: boolean } {
+  let transformed = content;
+  let usedMentions = false;
+  const entries = Object.entries(mentions).sort((a, b) => b[0].length - a[0].length);
+  for (const [displayToken, fullPath] of entries) {
+    if (!displayToken || !fullPath) continue;
+    const pattern = new RegExp(`(^|\\s)${escapeRegex(displayToken)}(?=\\s|$)`, "g");
+    const next = transformed.replace(pattern, (_match, leading: string) => `${leading}${fullPath}`);
+    if (next !== transformed) {
+      transformed = next;
+      usedMentions = true;
+    }
+  }
+  return { transformed, usedMentions };
 }
 
 function QueueIcon() {
@@ -2918,6 +2966,9 @@ const ComposerPanel = React.memo(function ComposerPanel({
   removeImage,
   msgInput,
   setMsgInput,
+  mentionTokens,
+  setMentionTokens,
+  workspaceFiles,
   fileInputRef,
   providers,
   showModelPicker,
@@ -2946,6 +2997,9 @@ const ComposerPanel = React.memo(function ComposerPanel({
   removeImage: (idx: number) => void;
   msgInput: string;
   setMsgInput: React.Dispatch<React.SetStateAction<string>>;
+  mentionTokens: Record<string, string>;
+  setMentionTokens: React.Dispatch<React.SetStateAction<Record<string, string>>>;
+  workspaceFiles: string[];
   fileInputRef: React.RefObject<HTMLInputElement | null>;
   providers: ProviderConfig[];
   showModelPicker: boolean;
@@ -2966,6 +3020,65 @@ const ComposerPanel = React.memo(function ComposerPanel({
   const activeLabel = useMemo(() => activeModelLabel(providers), [providers]);
   const activeId = useMemo(() => activeModelId(providers), [providers]);
   const canQueue = msgInput.trim().length > 0 || pendingImages.length > 0;
+  const [showPermissionPicker, setShowPermissionPicker] = useState(false);
+  const [cursorPos, setCursorPos] = useState(0);
+
+  const trigger = useMemo(() => {
+    const upToCursor = msgInput.slice(0, Math.max(0, Math.min(cursorPos, msgInput.length)));
+    const tokenMatch = upToCursor.match(/(^|\s)([^\s]*)$/);
+    const token = tokenMatch?.[2] ?? "";
+    const start = upToCursor.length - token.length;
+    if (token.startsWith("/")) return { type: "command" as const, token, query: token.slice(1).toLowerCase(), start };
+    if (token.startsWith("@")) return { type: "mention" as const, token, query: token.slice(1).toLowerCase(), start };
+    return null;
+  }, [msgInput, cursorPos]);
+
+  const commandSuggestions = useMemo(() => {
+    if (!trigger || trigger.type !== "command") return [];
+    return COMPOSER_COMMANDS.filter((c) => c.label.includes(trigger.query) || c.trigger.includes(trigger.query));
+  }, [trigger]);
+
+  const mentionSuggestions = useMemo(() => {
+    if (!trigger || trigger.type !== "mention") return [];
+    const q = trigger.query;
+    const filtered = workspaceFiles.filter((file) => {
+      if (!q) return true;
+      return file.toLowerCase().includes(q);
+    });
+    return filtered.slice(0, 40);
+  }, [trigger, workspaceFiles]);
+
+  const showSuggestionPopover = (trigger?.type === "command" && commandSuggestions.length > 0) || (trigger?.type === "mention" && mentionSuggestions.length > 0);
+
+  function replaceCurrentToken(nextToken: string) {
+    if (!trigger) return;
+    const head = msgInput.slice(0, trigger.start);
+    const tail = msgInput.slice(cursorPos);
+    const spaced = tail.startsWith(" ") || tail.length === 0 ? "" : " ";
+    const nextText = `${head}${nextToken}${spaced}${tail}`;
+    const nextCursor = (head + nextToken + spaced).length;
+    setMsgInput(nextText);
+    setCursorPos(nextCursor);
+  }
+
+  function chooseCommand(command: ComposerCommand) {
+    replaceCurrentToken(command.trigger);
+  }
+
+  function chooseMention(fullPath: string) {
+    const base = fullPath.split("/").pop() || fullPath;
+    const preferred = `@${base}`;
+    let token = preferred;
+    const existing = mentionTokens[token];
+    if (existing && existing !== fullPath) token = `@${fullPath}`;
+    let suffix = 2;
+    while (mentionTokens[token] && mentionTokens[token] !== fullPath) {
+      token = `${preferred}#${suffix}`;
+      suffix += 1;
+    }
+    replaceCurrentToken(token);
+    setMentionTokens((prev) => ({ ...prev, [token]: fullPath }));
+  }
 
   return (
     <div className="shrink-0 px-4 pb-4 pt-1">
@@ -2989,7 +3102,7 @@ const ComposerPanel = React.memo(function ComposerPanel({
             <div className="flex items-center gap-2 border-b border-[var(--border-subtle)] px-3.5 py-1.5 text-[11px] text-amber-400">
               <span className="inline-flex h-1.5 w-1.5 rounded-full bg-amber-400/90" />
               <span className="flex-1 truncate">
-                Queued next: {queuedDraft.content || `${queuedDraft.images?.length ?? 0} image${(queuedDraft.images?.length ?? 0) === 1 ? "" : "s"}`}
+                Queued next: {queuedDraft.displayContent || queuedDraft.content || `${queuedDraft.images?.length ?? 0} image${(queuedDraft.images?.length ?? 0) === 1 ? "" : "s"}`}
               </span>
               <button type="button" onClick={onClearQueued} className="text-[var(--text-dim)] transition hover:text-[var(--text-muted)]">Clear</button>
             </div>
@@ -3021,7 +3134,13 @@ const ComposerPanel = React.memo(function ComposerPanel({
 
           <textarea
             value={msgInput}
-            onChange={(e) => setMsgInput(e.target.value)}
+            onChange={(e) => {
+              setMsgInput(e.target.value);
+              setCursorPos(e.target.selectionStart ?? e.target.value.length);
+            }}
+            onClick={(e) => setCursorPos((e.target as HTMLTextAreaElement).selectionStart ?? msgInput.length)}
+            onKeyUp={(e) => setCursorPos((e.target as HTMLTextAreaElement).selectionStart ?? msgInput.length)}
+            onSelect={(e) => setCursorPos((e.target as HTMLTextAreaElement).selectionStart ?? msgInput.length)}
             onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); void onSend(e); } }}
             onPaste={async (e) => {
               const items = e.clipboardData.items;
@@ -3042,6 +3161,34 @@ const ComposerPanel = React.memo(function ComposerPanel({
             rows={2}
             className="w-full resize-none bg-transparent px-4 pb-1.5 pt-3 text-[13px] leading-relaxed text-[var(--text-primary)] outline-none placeholder:text-[var(--text-dimmest)]"
           />
+          {showSuggestionPopover && (
+            <div className="px-3 pb-1">
+              <div className="max-h-48 overflow-auto rounded-lg border border-[var(--border-strong)] bg-[var(--bg-elevated)] py-1 shadow-lg shadow-black/30">
+                {trigger?.type === "command" && commandSuggestions.map((command) => (
+                  <button
+                    key={command.id}
+                    type="button"
+                    onClick={() => chooseCommand(command)}
+                    className="flex w-full items-center justify-between px-3 py-[6px] text-left text-[12px] text-[var(--text-muted)] transition hover:bg-[var(--bg-active)] hover:text-[var(--text-primary)]"
+                  >
+                    <span className="font-mono text-[11px]">{command.trigger}</span>
+                    <span className="text-[10px] text-[var(--text-dimmer)]">{command.description}</span>
+                  </button>
+                ))}
+                {trigger?.type === "mention" && mentionSuggestions.map((filePath) => (
+                  <button
+                    key={filePath}
+                    type="button"
+                    onClick={() => chooseMention(filePath)}
+                    className="flex w-full items-center gap-2 px-3 py-[6px] text-left text-[12px] text-[var(--text-muted)] transition hover:bg-[var(--bg-active)] hover:text-[var(--text-primary)]"
+                  >
+                    <FileIcon name={filePath} />
+                    <span className="truncate">{filePath}</span>
+                  </button>
+                ))}
+              </div>
+            </div>
+          )}
           <input
             ref={fileInputRef}
             type="file"
@@ -3080,10 +3227,40 @@ const ComposerPanel = React.memo(function ComposerPanel({
               )}
             </div>
             <div className="mx-1 h-3.5 w-px bg-[var(--bg-active)]" />
-            <button type="button" onClick={() => setPermission((p) => (p === "full" ? "approve" : "full"))} className="flex items-center gap-1 rounded-md px-2 py-1 text-[12px] text-[var(--text-dim)] transition hover:bg-[var(--bg-active)] hover:text-[var(--text-muted)]">
-              {permission === "full" ? <UnlockIcon /> : <LockIcon />}
-              {permission === "full" ? "Full access" : "Ask first"}
-            </button>
+            <div className="relative">
+              <button
+                type="button"
+                onClick={() => setShowPermissionPicker((v) => !v)}
+                className="flex items-center gap-1 rounded-md px-2 py-1 text-[12px] text-[var(--text-dim)] transition hover:bg-[var(--bg-active)] hover:text-[var(--text-muted)]"
+              >
+                {permission === "full" ? <UnlockIcon /> : <LockIcon />}
+                {permission === "full" ? "Full access" : "Ask first"}
+                <ChevronIcon open={showPermissionPicker} />
+              </button>
+              {showPermissionPicker && (
+                <>
+                  <div className="fixed inset-0 z-10" onClick={() => setShowPermissionPicker(false)} />
+                  <div className="absolute bottom-full left-0 z-20 mb-1 w-36 overflow-hidden rounded-lg border border-[var(--border-strong)] bg-[var(--bg-elevated)] py-1 shadow-xl shadow-black/40">
+                    <button
+                      type="button"
+                      onClick={() => { setPermission("full"); setShowPermissionPicker(false); }}
+                      className={`flex w-full items-center gap-2 px-3 py-[6px] text-left text-[12px] transition hover:bg-[var(--bg-active)] ${permission === "full" ? "text-[var(--text-primary)]" : "text-[var(--text-muted)]"}`}
+                    >
+                      <UnlockIcon />
+                      Full access
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => { setPermission("approve"); setShowPermissionPicker(false); }}
+                      className={`flex w-full items-center gap-2 px-3 py-[6px] text-left text-[12px] transition hover:bg-[var(--bg-active)] ${permission === "approve" ? "text-[var(--text-primary)]" : "text-[var(--text-muted)]"}`}
+                    >
+                      <LockIcon />
+                      Ask first
+                    </button>
+                  </div>
+                </>
+              )}
+            </div>
             <div className="mx-1 h-3.5 w-px bg-[var(--bg-active)]" />
             <ThinkingLevelPicker
               level={thinkingLevel}
@@ -3114,6 +3291,8 @@ const ComposerPanel = React.memo(function ComposerPanel({
   prev.dragOver === next.dragOver &&
   prev.pendingImages === next.pendingImages &&
   prev.msgInput === next.msgInput &&
+  prev.mentionTokens === next.mentionTokens &&
+  prev.workspaceFiles === next.workspaceFiles &&
   prev.providers === next.providers &&
   prev.showModelPicker === next.showModelPicker &&
   prev.permission === next.permission &&
@@ -3348,7 +3527,10 @@ export default function App() {
   const [gitStatus, setGitStatus] = useState<GitStatusInfo>({ changes: 0, staged: 0, isRepo: false });
   const [installedEditors, setInstalledEditors] = useState<InstalledEditor[]>([]);
   const [preferredEditorId, setPreferredEditorId] = useState<InstalledEditor["id"]>("vscode");
+  const [workspaceFiles, setWorkspaceFiles] = useState<string[]>([]);
+  const [mentionTokens, setMentionTokens] = useState<Record<string, string>>({});
   const [queuedMessagesByThread, setQueuedMessagesByThread] = useState<Record<string, QueuedMessageDraft>>({});
+  const [threadSidebarMemory, setThreadSidebarMemory] = useState<Record<string, RightSidebarState>>({});
   // Right sidebar state — subagent uses msgId for live reactivity (reads from state.messages)
   const [rightSidebar, setRightSidebar] = useState<RightSidebarState | null>(null);
   // Git actions dropdown
@@ -3388,6 +3570,9 @@ export default function App() {
   const permissionRef = useRef<PermissionMode>("full");
   const queuedMessagesRef = useRef<Record<string, QueuedMessageDraft>>({});
   const activeModelIdRef = useRef("");
+  const threadSidebarMemoryRef = useRef<Record<string, RightSidebarState>>({});
+  const lastSidebarThreadRef = useRef<string | null>(null);
+  const prevSelThreadIdRef = useRef<string | null>(null);
 
   renderStartRef.current = performance.now();
 
@@ -3416,6 +3601,10 @@ export default function App() {
   useEffect(() => {
     activeModelIdRef.current = activeModelId(state.providers);
   }, [state.providers]);
+
+  useEffect(() => {
+    threadSidebarMemoryRef.current = threadSidebarMemory;
+  }, [threadSidebarMemory]);
 
   useEffect(() => {
     try {
@@ -3726,6 +3915,20 @@ export default function App() {
 
   // When switching threads: clear stale stream state and refresh messages from store
   useEffect(() => {
+    const prevThreadId = prevSelThreadIdRef.current;
+    if (prevThreadId && prevThreadId !== selThreadId && rightSidebar) {
+      rememberSidebarForThread(prevThreadId, rightSidebar);
+      lastSidebarThreadRef.current = prevThreadId;
+    }
+    if (selThreadId && lastSidebarThreadRef.current === selThreadId) {
+      const saved = threadSidebarMemoryRef.current[selThreadId];
+      setRightSidebar(saved ?? null);
+      lastSidebarThreadRef.current = null;
+    } else {
+      setRightSidebar(null);
+    }
+    prevSelThreadIdRef.current = selThreadId;
+
     streamChunkBufferRef.current = "";
     pendingMessageUpdatesRef.current.clear();
     if (messageUpdatesRafRef.current !== null) {
@@ -3750,10 +3953,14 @@ export default function App() {
       setGitBranches([]);
       setCurrentBranch("");
       setGitStatus({ changes: 0, staged: 0, isRepo: false });
+      setWorkspaceFiles([]);
       return;
     }
     window.sncode.getGitBranches(selProject.folderPath).then((r) => { setGitBranches(r.branches); setCurrentBranch(r.current); });
     window.sncode.getGitStatus(selProject.folderPath).then(setGitStatus);
+    window.sncode.getFileTree(selProject.folderPath, 8).then((entries) => {
+      setWorkspaceFiles(flattenFileTreeEntries(entries));
+    }).catch(() => setWorkspaceFiles([]));
   }, [selProject]);
 
   useEffect(() => {
@@ -3928,6 +4135,16 @@ export default function App() {
       }
       return changed ? filtered : prev;
     });
+    setThreadSidebarMemory((prev) => {
+      let changed = false;
+      const filtered: Record<string, RightSidebarState> = {};
+      for (const [threadId, sidebar] of Object.entries(prev)) {
+        if (validThreadIds.has(threadId)) filtered[threadId] = sidebar;
+        else changed = true;
+      }
+      if (changed) threadSidebarMemoryRef.current = filtered;
+      return changed ? filtered : prev;
+    });
   }
 
   async function refreshThreadMessageMeta() {
@@ -3989,7 +4206,7 @@ export default function App() {
       const nextProject = next.projects[0] ?? null;
       setSelProjectId(nextProject?.id ?? null);
       setSelThreadId(nextProject ? (next.threads.find((t) => t.projectId === nextProject.id)?.id ?? null) : null);
-      setRightSidebar(null);
+      closeRightSidebar(false);
       return;
     }
     if (selThreadId && !next.threads.some((t) => t.id === selThreadId)) {
@@ -4013,6 +4230,39 @@ export default function App() {
       setStatusText(res.message || "Failed to open project in editor");
       window.setTimeout(() => setStatusText("Idle"), 3000);
     }
+  }
+
+  function rememberSidebarForThread(threadId: string, sidebar: RightSidebarState) {
+    setThreadSidebarMemory((prev) => {
+      const next = { ...prev, [threadId]: sidebar };
+      threadSidebarMemoryRef.current = next;
+      return next;
+    });
+  }
+
+  function forgetSidebarForThread(threadId: string) {
+    setThreadSidebarMemory((prev) => {
+      if (!prev[threadId]) return prev;
+      const next = { ...prev };
+      delete next[threadId];
+      threadSidebarMemoryRef.current = next;
+      return next;
+    });
+  }
+
+  function openRightSidebar(next: RightSidebarState) {
+    setRightSidebar(next);
+    if (selThreadId) rememberSidebarForThread(selThreadId, next);
+  }
+
+  function closeRightSidebar(clearRemembered = false) {
+    if (clearRemembered && selThreadId) {
+      forgetSidebarForThread(selThreadId);
+      if (lastSidebarThreadRef.current === selThreadId) {
+        lastSidebarThreadRef.current = null;
+      }
+    }
+    setRightSidebar(null);
   }
 
   async function deleteThread(threadId: string) {
@@ -4058,6 +4308,17 @@ export default function App() {
     }
   }
 
+  async function runCompactCommand(threadId: string) {
+    const result = await window.sncode.compactThread(threadId);
+    trackIpcPayload(result.state);
+    applyStateWithoutMessages(result.state);
+    await refreshThreadMessages(threadId);
+    await refreshThreadMessageMeta();
+    if (result.compacted) setStatusText(`Compacted history (${result.removed} messages removed)`);
+    else setStatusText("No compaction needed");
+    window.setTimeout(() => setStatusText("Idle"), 2200);
+  }
+
   function queueMessageForThread(threadId: string, draft: QueuedMessageDraft) {
     const next = { ...queuedMessagesRef.current, [threadId]: draft };
     queuedMessagesRef.current = next;
@@ -4084,6 +4345,7 @@ export default function App() {
     if (!options?.fromQueue) {
       setMsgInput("");
       setPendingImages([]);
+      setMentionTokens({});
     }
 
     startPerfTurn(threadId);
@@ -4107,6 +4369,7 @@ export default function App() {
       const next = await window.sncode.sendMessage({
         threadId,
         content,
+        displayContent: draft.displayContent,
         images,
         permissionMode: permissionRef.current,
       });
@@ -4138,11 +4401,32 @@ export default function App() {
 
   async function send(e: FormEvent) {
     e.preventDefault();
-    const hasText = msgInput.trim().length > 0;
+    const trimmedInput = msgInput.trim();
+    const hasText = trimmedInput.length > 0;
     const hasImages = pendingImages.length > 0;
     if (!selThreadId || (!hasText && !hasImages)) return;
+
+    if (!hasImages && trimmedInput.startsWith("/")) {
+      if (trimmedInput !== "/compact") {
+        setStatusText("Unknown command");
+        window.setTimeout(() => setStatusText("Idle"), 1800);
+        return;
+      }
+      if (isBusy) {
+        setStatusText("Wait for current run to finish");
+        window.setTimeout(() => setStatusText("Idle"), 1800);
+        return;
+      }
+      setMsgInput("");
+      setMentionTokens({});
+      await runCompactCommand(selThreadId);
+      return;
+    }
+
+    const mentionResolved = resolveMentionContent(trimmedInput, mentionTokens);
     const draft: QueuedMessageDraft = {
-      content: msgInput.trim(),
+      content: mentionResolved.transformed,
+      displayContent: mentionResolved.usedMentions ? trimmedInput : undefined,
       images: pendingImages.length > 0 ? [...pendingImages] : undefined,
     };
 
@@ -4150,6 +4434,7 @@ export default function App() {
       queueMessageForThread(selThreadId, draft);
       setMsgInput("");
       setPendingImages([]);
+      setMentionTokens({});
       setStatusText("Queued next message");
       return;
     }
@@ -4165,13 +4450,13 @@ export default function App() {
   async function openFileInSidebar(relativePath: string) {
     if (!selProject) return;
     const content = await window.sncode.readFileContent(selProject.folderPath, relativePath);
-    setRightSidebar({ type: "file", filePath: relativePath, fileContent: content });
+    openRightSidebar({ type: "file", filePath: relativePath, fileContent: content });
   }
 
   async function openDiffInSidebar() {
     if (!selProject) return;
     const diffs = await window.sncode.getGitDiff(selProject.folderPath);
-    setRightSidebar({ type: "diff", diffs });
+    openRightSidebar({ type: "diff", diffs });
   }
 
   async function handleGitAction(action: string, args?: Record<string, string>) {
@@ -4187,8 +4472,8 @@ export default function App() {
   }
 
   const openSubAgentInSidebar = useCallback((msg: ThreadMessage) => {
-    setRightSidebar({ type: "subagent", taskMsgId: msg.id });
-  }, []);
+    openRightSidebar({ type: "subagent", taskMsgId: msg.id });
+  }, [selThreadId]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Todo system
   function addTodo(content: string) {
@@ -4483,6 +4768,9 @@ export default function App() {
             removeImage={removeImage}
             msgInput={msgInput}
             setMsgInput={setMsgInput}
+            mentionTokens={mentionTokens}
+            setMentionTokens={setMentionTokens}
+            workspaceFiles={workspaceFiles}
             fileInputRef={fileInputRef}
             providers={state.providers}
             showModelPicker={showModelPicker}
@@ -4577,7 +4865,7 @@ export default function App() {
       <RightSidebarPane
         rightSidebar={rightSidebar}
         liveTaskMsg={liveRightSidebarTaskMsg}
-        onClose={() => setRightSidebar(null)}
+        onClose={() => closeRightSidebar(true)}
       />
 
       {showPerfPanel && (
