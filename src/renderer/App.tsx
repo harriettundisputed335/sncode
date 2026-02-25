@@ -2596,6 +2596,7 @@ export default function App() {
   const [todos, setTodos] = useState<TodoItem[]>([]);
   const [threadMessageMetaRows, setThreadMessageMetaRows] = useState<ThreadMessageSummary[]>([]);
   const [showPerfPanel, setShowPerfPanel] = useState(false);
+  const [perfRendererLogsEnabled, setPerfRendererLogsEnabled] = useState(false);
   const [perfPanelTick, setPerfPanelTick] = useState(0);
   const [lastPerfTurn, setLastPerfTurn] = useState<PerfTurnSnapshot | null>(null);
 
@@ -2631,14 +2632,13 @@ export default function App() {
 
   useEffect(() => {
     try {
-      perfRendererRef.current = window.localStorage.getItem("sncode.perf.renderer") === "1";
+      const rendererEnabled = window.localStorage.getItem("sncode.perf.renderer") === "1";
       const perfPanelEnabled = window.localStorage.getItem("sncode.perf.panel") === "1";
-      perfPanelRef.current = perfPanelEnabled;
-      setShowPerfPanel(perfPanelEnabled);
+      togglePerfRendererLogs(rendererEnabled);
+      togglePerfPanel(perfPanelEnabled);
     } catch {
-      perfRendererRef.current = false;
-      perfPanelRef.current = false;
-      setShowPerfPanel(false);
+      togglePerfRendererLogs(false);
+      togglePerfPanel(false);
     }
   }, []);
 
@@ -3024,6 +3024,35 @@ export default function App() {
     const snapshot: PerfTurnSnapshot = { ...active, endedAtMs: performance.now() };
     perfActiveTurnRef.current = null;
     setLastPerfTurn(snapshot);
+  }
+
+  function togglePerfPanel(enabled: boolean) {
+    setShowPerfPanel(enabled);
+    perfPanelRef.current = enabled;
+    try {
+      if (enabled) window.localStorage.setItem("sncode.perf.panel", "1");
+      else window.localStorage.removeItem("sncode.perf.panel");
+    } catch {
+      // ignore storage errors
+    }
+  }
+
+  function togglePerfRendererLogs(enabled: boolean) {
+    setPerfRendererLogsEnabled(enabled);
+    perfRendererRef.current = enabled;
+    try {
+      if (enabled) window.localStorage.setItem("sncode.perf.renderer", "1");
+      else window.localStorage.removeItem("sncode.perf.renderer");
+    } catch {
+      // ignore storage errors
+    }
+  }
+
+  function resetPerfMetrics() {
+    perfGlobalRef.current = makeEmptyPerfAggregate();
+    perfActiveTurnRef.current = null;
+    setLastPerfTurn(null);
+    setPerfPanelTick((prev) => prev + 1);
   }
 
   function applyStateWithoutMessages(next: AppState) {
@@ -3611,7 +3640,31 @@ export default function App() {
       )}
 
       {showSettings && (
-        <SettingsModal providers={state.providers} settings={state.settings} projectId={selProjectId} projectPath={selProject?.folderPath ?? null} onClose={() => setShowSettings(false)} onUpdateProvider={updateProvider} onSaveCredential={saveCredential} onUpdateSettings={updateSettings} onClearAllData={async () => { const s = await window.sncode.clearAllData(); trackIpcPayload(s); applyStateWithoutMessages(s); setThreadMessageMetaRows([]); setSelProjectId(null); setSelThreadId(null); setExpandedProjects(new Set()); setShowSettings(false); }} />
+        <SettingsModal
+          providers={state.providers}
+          settings={state.settings}
+          projectId={selProjectId}
+          projectPath={selProject?.folderPath ?? null}
+          onClose={() => setShowSettings(false)}
+          onUpdateProvider={updateProvider}
+          onSaveCredential={saveCredential}
+          onUpdateSettings={updateSettings}
+          onClearAllData={async () => {
+            const s = await window.sncode.clearAllData();
+            trackIpcPayload(s);
+            applyStateWithoutMessages(s);
+            setThreadMessageMetaRows([]);
+            setSelProjectId(null);
+            setSelThreadId(null);
+            setExpandedProjects(new Set());
+            setShowSettings(false);
+          }}
+          perfPanelEnabled={showPerfPanel}
+          perfRendererLogsEnabled={perfRendererLogsEnabled}
+          onTogglePerfPanel={togglePerfPanel}
+          onTogglePerfRendererLogs={togglePerfRendererLogs}
+          onResetPerfMetrics={resetPerfMetrics}
+        />
       )}
     </div>
   );

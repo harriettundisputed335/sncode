@@ -42,6 +42,11 @@ interface Props {
   onSaveCredential: (providerId: string, credential: string) => Promise<void>;
   onUpdateSettings: (updates: Partial<AgentSettings>) => Promise<void>;
   onClearAllData: () => Promise<void>;
+  perfPanelEnabled: boolean;
+  perfRendererLogsEnabled: boolean;
+  onTogglePerfPanel: (enabled: boolean) => void;
+  onTogglePerfRendererLogs: (enabled: boolean) => void;
+  onResetPerfMetrics: () => void;
 }
 
 type Tab = "general" | "providers" | "agent" | "tasks" | "skills" | "data";
@@ -139,6 +144,11 @@ export default function SettingsModal({
   onSaveCredential,
   onUpdateSettings,
   onClearAllData,
+  perfPanelEnabled,
+  perfRendererLogsEnabled,
+  onTogglePerfPanel,
+  onTogglePerfRendererLogs,
+  onResetPerfMetrics,
 }: Props) {
   const [tab, setTab] = useState<Tab>("general");
   const [drafts, setDrafts] = useState<Record<string, string>>({});
@@ -352,6 +362,49 @@ export default function SettingsModal({
                         className="rounded-lg border border-[var(--border-strong)] bg-[var(--bg-card)] px-3.5 py-1.5 text-[12px] text-[var(--text-label)] transition hover:bg-[var(--bg-elevated)] hover:text-[var(--text-primary)]"
                       >
                         Open
+                      </button>
+                    </div>
+                  </div>
+                  <div className="mt-3 rounded-lg border border-[var(--border-subtle)] bg-[var(--bg-surface)] p-4">
+                    <div className="mb-3">
+                      <div className="text-[13px] font-medium text-[var(--text-primary)]">Diagnostics</div>
+                      <div className="mt-0.5 text-[11px] text-[var(--text-dim)]">Performance instrumentation controls for long-thread debugging</div>
+                    </div>
+
+                    <div className="space-y-2.5">
+                      <div className="flex items-center justify-between">
+                        <div>
+                          <div className="text-[12px] text-[var(--text-label)]">Show renderer perf panel</div>
+                          <div className="text-[10px] text-[var(--text-dimmest)]">Displays turn-level render, commit, and IPC metrics</div>
+                        </div>
+                        <button
+                          onClick={() => onTogglePerfPanel(!perfPanelEnabled)}
+                          className={`relative h-[22px] w-[40px] rounded-full transition-colors ${perfPanelEnabled ? "bg-[var(--toggle-on)]" : "bg-[var(--bg-active)]"}`}
+                        >
+                          <div className={`absolute top-[3px] h-4 w-4 rounded-full bg-white shadow-sm transition-transform ${perfPanelEnabled ? "translate-x-[20px]" : "translate-x-[3px]"}`}/>
+                        </button>
+                      </div>
+
+                      <div className="flex items-center justify-between">
+                        <div>
+                          <div className="text-[12px] text-[var(--text-label)]">Enable renderer debug logs</div>
+                          <div className="text-[10px] text-[var(--text-dimmest)]">Logs batched message flush timings in DevTools console</div>
+                        </div>
+                        <button
+                          onClick={() => onTogglePerfRendererLogs(!perfRendererLogsEnabled)}
+                          className={`relative h-[22px] w-[40px] rounded-full transition-colors ${perfRendererLogsEnabled ? "bg-[var(--toggle-on)]" : "bg-[var(--bg-active)]"}`}
+                        >
+                          <div className={`absolute top-[3px] h-4 w-4 rounded-full bg-white shadow-sm transition-transform ${perfRendererLogsEnabled ? "translate-x-[20px]" : "translate-x-[3px]"}`}/>
+                        </button>
+                      </div>
+                    </div>
+
+                    <div className="mt-3 flex justify-end">
+                      <button
+                        onClick={onResetPerfMetrics}
+                        className="rounded-lg border border-[var(--border-strong)] bg-[var(--bg-card)] px-3.5 py-1.5 text-[11px] text-[var(--text-label)] transition hover:bg-[var(--bg-elevated)] hover:text-[var(--text-primary)]"
+                      >
+                        Reset metrics
                       </button>
                     </div>
                   </div>
