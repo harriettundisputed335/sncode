@@ -13,6 +13,13 @@ export const newThreadInputSchema = z.object({
   title: z.string().trim().min(1).max(160)
 });
 
+export const threadUpdateInputSchema = z.object({
+  threadId: z.string().trim().min(1),
+  title: z.string().trim().min(1).max(160).optional(),
+  codexThreadId: z.string().trim().min(1).optional(),
+  lastModel: z.string().trim().min(1).max(120).optional(),
+});
+
 export const imageAttachmentSchema = z.object({
   data: z.string().min(1),
   mediaType: z.enum(["image/jpeg", "image/png", "image/gif", "image/webp"]),

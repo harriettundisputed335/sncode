@@ -104,6 +104,7 @@ export class Store {
         projectId: thread.projectId,
         title: thread.title,
         codexThreadId: (thread as Thread).codexThreadId,
+        lastModel: (thread as Thread).lastModel,
         createdAt: thread.createdAt,
         updatedAt: thread.updatedAt
       })),
@@ -294,12 +295,23 @@ export class Store {
     return entry;
   }
 
+  deleteProject(projectId: string): void {
+    this.state.projects = this.state.projects.filter((p) => p.id !== projectId);
+    const removedThreadIds = new Set(this.state.threads.filter((t) => t.projectId === projectId).map((t) => t.id));
+    this.state.threads = this.state.threads.filter((t) => t.projectId !== projectId);
+    this.state.messages = this.state.messages.filter((m) => !removedThreadIds.has(m.threadId));
+    this.state.projectSkills = this.state.projectSkills.filter((ps) => ps.projectId !== projectId);
+    for (const threadId of removedThreadIds) this.threadMessageMetaById.delete(threadId);
+    this.persist();
+  }
+
   createThread(input: NewThreadInput): Thread {
     const thread: Thread = {
       id: nanoid(),
       projectId: input.projectId,
       title: input.title,
       codexThreadId: undefined,
+      lastModel: undefined,
       createdAt: now(),
       updatedAt: now()
     };
@@ -316,11 +328,12 @@ export class Store {
     this.persist();
   }
 
-  updateThread(threadId: string, updates: Partial<Pick<Thread, "title" | "codexThreadId">>): Thread | undefined {
+  updateThread(threadId: string, updates: Partial<Pick<Thread, "title" | "codexThreadId" | "lastModel">>): Thread | undefined {
     const thread = this.state.threads.find((t) => t.id === threadId);
     if (!thread) return undefined;
     if (updates.title !== undefined) thread.title = updates.title;
     if (updates.codexThreadId !== undefined) thread.codexThreadId = updates.codexThreadId;
+    if (updates.lastModel !== undefined) thread.lastModel = updates.lastModel;
     thread.updatedAt = now();
     this.persist();
     return structuredClone(thread);

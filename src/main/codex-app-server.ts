@@ -49,6 +49,8 @@ export interface CodexRunInput {
   projectRoot: string;
   localThreadId: string;
   localCodexThreadId?: string;
+  /** Optional seed context when a local thread is first switched to Codex. */
+  seedHistoryText?: string;
   content: string;
   images?: ImageAttachment[];
   permissionMode: CodexApprovalMode;
@@ -607,6 +609,9 @@ export async function runCodexAppServerTurn(input: CodexRunInput): Promise<Codex
     if (!codexThreadId) throw new Error("Failed to obtain Codex thread id");
 
     const userInput: any[] = [];
+    if (!input.localCodexThreadId && input.seedHistoryText?.trim()) {
+      userInput.push({ type: "text", text: input.seedHistoryText.trim(), text_elements: [] });
+    }
     if (input.content.length > 0) {
       userInput.push({ type: "text", text: input.content, text_elements: [] });
     }

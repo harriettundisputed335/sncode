@@ -1,5 +1,5 @@
 import { contextBridge, ipcRenderer } from "electron";
-import { AgentEventMap, AgentSettings, FileTreeEntry, GitDiffEntry, NewProjectInput, NewThreadInput, ProviderCredentialInput, ProviderUpdateInput, Skill, SkillContent, ProjectSkillConfig, SendMessageInput, SncodeApi } from "../shared/types";
+import { AgentEventMap, AgentSettings, FileTreeEntry, GitDiffEntry, InstalledEditor, NewProjectInput, NewThreadInput, ProviderCredentialInput, ProviderUpdateInput, Skill, SkillContent, ProjectSkillConfig, SendMessageInput, SncodeApi, ThreadUpdateInput } from "../shared/types";
 
 const api: SncodeApi = {
   getState: () => ipcRenderer.invoke("state:get"),
@@ -7,8 +7,12 @@ const api: SncodeApi = {
   getThreadMessageMeta: () => ipcRenderer.invoke("thread:meta"),
   pickFolder: () => ipcRenderer.invoke("folder:pick"),
   createProject: (payload: NewProjectInput) => ipcRenderer.invoke("project:create", payload),
+  deleteProject: (projectId: string) => ipcRenderer.invoke("project:delete", projectId),
+  openProjectInExplorer: (projectPath: string): Promise<{ success: boolean; message?: string }> =>
+    ipcRenderer.invoke("project:open-in-explorer", projectPath),
   createThread: (payload: NewThreadInput) => ipcRenderer.invoke("thread:create", payload),
   deleteThread: (threadId: string) => ipcRenderer.invoke("thread:delete", threadId),
+  updateThread: (payload: ThreadUpdateInput) => ipcRenderer.invoke("thread:update", payload),
   updateProvider: (payload: ProviderUpdateInput) => ipcRenderer.invoke("provider:update", payload),
   updateProviderBatch: (payload: ProviderUpdateInput[]) => ipcRenderer.invoke("provider:update-batch", payload),
   setProviderCredential: (payload: ProviderCredentialInput) =>
@@ -18,6 +22,9 @@ const api: SncodeApi = {
   openExternal: (url: string) => ipcRenderer.invoke("open-external", url),
   getGitBranches: (projectPath: string) => ipcRenderer.invoke("git:branches", projectPath),
   getGitStatus: (projectPath: string) => ipcRenderer.invoke("git:status", projectPath),
+  getInstalledEditors: (): Promise<InstalledEditor[]> => ipcRenderer.invoke("editor:list"),
+  openProjectInEditor: (projectPath: string, editorId: InstalledEditor["id"]): Promise<{ success: boolean; message?: string }> =>
+    ipcRenderer.invoke("project:open-in-editor", projectPath, editorId),
   getFileTree: (projectPath: string, depth?: number): Promise<FileTreeEntry[]> => ipcRenderer.invoke("filetree:get", projectPath, depth),
   updateSettings: (settings: Partial<AgentSettings>) => ipcRenderer.invoke("settings:update", settings),
   oauthAnthropicStart: () => ipcRenderer.invoke("oauth:anthropic:start"),

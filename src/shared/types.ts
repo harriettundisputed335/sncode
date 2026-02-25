@@ -54,6 +54,8 @@ export interface ThreadMessage {
     taskTrail?: SubAgentTrailEntry[];
     /** Sub-agent unique task ID for sidebar detail view */
     taskId?: string;
+    /** Optional tool input payload snapshot for richer UI rendering */
+    toolArgs?: Record<string, unknown>;
   };
 }
 
@@ -63,6 +65,8 @@ export interface Thread {
   title: string;
   /** Backing Codex app-server thread id (when using codex provider integration) */
   codexThreadId?: string;
+  /** Last model used in this thread (for thread-scoped model stickiness in UI) */
+  lastModel?: string;
   createdAt: string;
   updatedAt: string;
 }
@@ -145,6 +149,18 @@ export interface ProviderCredentialInput {
   credential: string;
 }
 
+export interface ThreadUpdateInput {
+  threadId: string;
+  title?: string;
+  codexThreadId?: string;
+  lastModel?: string;
+}
+
+export interface InstalledEditor {
+  id: "vscode" | "cursor";
+  label: string;
+}
+
 export interface AgentStatusEvent {
   threadId: string;
   status: "idle" | "running" | "error" | "cancelled";
@@ -185,6 +201,10 @@ export interface GitDiffEntry {
   file: string;
   status: "modified" | "added" | "deleted" | "renamed" | "untracked";
   diff: string;
+  /** File content before change (if available and text) */
+  beforeContent?: string;
+  /** File content after change (if available and text) */
+  afterContent?: string;
 }
 
 export interface TodoItem {
@@ -255,8 +275,11 @@ export interface SncodeApi {
   getThreadMessageMeta: () => Promise<ThreadMessageSummary[]>;
   pickFolder: () => Promise<string | null>;
   createProject: (payload: NewProjectInput) => Promise<Project>;
+  deleteProject: (projectId: string) => Promise<AppState>;
+  openProjectInExplorer: (projectPath: string) => Promise<{ success: boolean; message?: string }>;
   createThread: (payload: NewThreadInput) => Promise<Thread>;
   deleteThread: (threadId: string) => Promise<AppState>;
+  updateThread: (payload: ThreadUpdateInput) => Promise<Thread | null>;
   updateProvider: (payload: ProviderUpdateInput) => Promise<ProviderConfig[]>;
   updateProviderBatch: (payload: ProviderUpdateInput[]) => Promise<ProviderConfig[]>;
   setProviderCredential: (payload: ProviderCredentialInput) => Promise<ProviderConfig[]>;
@@ -265,6 +288,8 @@ export interface SncodeApi {
   openExternal: (url: string) => Promise<void>;
   getGitBranches: (projectPath: string) => Promise<{ current: string; branches: string[] }>;
   getGitStatus: (projectPath: string) => Promise<GitStatusInfo>;
+  getInstalledEditors: () => Promise<InstalledEditor[]>;
+  openProjectInEditor: (projectPath: string, editorId: InstalledEditor["id"]) => Promise<{ success: boolean; message?: string }>;
   getFileTree: (projectPath: string, depth?: number) => Promise<FileTreeEntry[]>;
   updateSettings: (settings: Partial<AgentSettings>) => Promise<AgentSettings>;
   oauthAnthropicStart: () => Promise<{ url: string }>;

@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { execFile } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import { promisify } from "node:util";
@@ -22,9 +22,10 @@ import {
   providerCredentialInputSchema,
   providerUpdateBatchInputSchema,
   providerUpdateInputSchema,
-  sendMessageInputSchema
+  sendMessageInputSchema,
+  threadUpdateInputSchema,
 } from "../shared/schema";
-import { AgentEventMap, AppState, ProviderConfig, SubAgentTrailEntry } from "../shared/types";
+import { AgentEventMap, AppState, InstalledEditor, ProviderConfig, SubAgentTrailEntry, ThreadMessage } from "../shared/types";
 import { smallestAvailableModelId, providerForModelId } from "../shared/models";
 
 const isDev = !app.isPackaged;
@@ -39,6 +40,217 @@ function emit<T extends keyof AgentEventMap>(channel: T, payload: AgentEventMap[
 
 function toRendererState(state: AppState): AppState {
   return { ...state, messages: [] };
+}
+
+const MAX_DIFF_CONTENT_BYTES = 220_000;
+
+function normalizeGitPath(filePath: string): string {
+  return filePath.replace(/\\/g, "/");
+}
+
+function resolveInsideProject(projectPath: string, relativePath: string): string | null {
+  const root = path.resolve(projectPath);
+  const target = path.resolve(root, relativePath);
+  if (!target.startsWith(root)) return null;
+  return target;
+}
+
+function readTextFileIfSmall(filePath: string): string | undefined {
+  try {
+    if (!fs.existsSync(filePath)) return undefined;
+    const stat = fs.statSync(filePath);
+    if (!stat.isFile()) return undefined;
+    if (stat.size > MAX_DIFF_CONTENT_BYTES) {
+      return `[File too large to preview: ${Math.round(stat.size / 1024)}KB]`;
+    }
+    return fs.readFileSync(filePath, "utf-8");
+  } catch {
+    return undefined;
+  }
+}
+
+async function readGitHeadFile(projectPath: string, relativePath: string): Promise<string | undefined> {
+  const normalizedPath = normalizeGitPath(relativePath).trim();
+  if (!normalizedPath) return undefined;
+  try {
+    const { stdout } = await execFileAsync("git", ["show", `HEAD:${normalizedPath}`], {
+      cwd: projectPath,
+      maxBuffer: 1024 * 1024 * 2,
+      encoding: "utf8",
+    });
+    if (!stdout) return "";
+    if (Buffer.byteLength(stdout, "utf8") > MAX_DIFF_CONTENT_BYTES) {
+      return `[File too large to preview: ${Math.round(Buffer.byteLength(stdout, "utf8") / 1024)}KB]`;
+    }
+    return stdout;
+  } catch {
+    return undefined;
+  }
+}
+
+function safePreviewString(value: unknown, maxChars = 160_000): string | undefined {
+  if (typeof value !== "string") return undefined;
+  if (value.length <= maxChars) return value;
+  return value.slice(0, maxChars) + "\n...[truncated]";
+}
+
+function coreToolName(name: string): string {
+  const idx = name.lastIndexOf("__");
+  return idx >= 0 ? name.slice(idx + 2) : name;
+}
+
+function readStringArg(args: Record<string, unknown>, keys: string[]): string | undefined {
+  for (const key of keys) {
+    const val = args[key];
+    if (typeof val === "string" && val.length > 0) return val;
+  }
+  return undefined;
+}
+
+function listFilesRecursively(rootDir: string, maxFiles = 300): string[] {
+  const output: string[] = [];
+  const dirs: string[] = [rootDir];
+  while (dirs.length > 0 && output.length < maxFiles) {
+    const current = dirs.pop();
+    if (!current) break;
+    let entries: fs.Dirent[];
+    try {
+      entries = fs.readdirSync(current, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+    entries.sort((a, b) => a.name.localeCompare(b.name));
+    for (const entry of entries) {
+      if (output.length >= maxFiles) break;
+      const abs = path.join(current, entry.name);
+      if (entry.isDirectory()) {
+        dirs.push(abs);
+      } else if (entry.isFile()) {
+        output.push(abs);
+      }
+    }
+  }
+  return output;
+}
+
+const EDITOR_CANDIDATES: Array<{ id: InstalledEditor["id"]; label: string; commands: string[] }> = [
+  { id: "vscode", label: "VS Code", commands: process.platform === "win32" ? ["code.cmd", "code"] : ["code"] },
+  { id: "cursor", label: "Cursor", commands: process.platform === "win32" ? ["cursor.cmd", "cursor"] : ["cursor"] },
+];
+
+async function commandExists(command: string): Promise<boolean> {
+  try {
+    if (process.platform === "win32") {
+      await execFileAsync("where", [command], { windowsHide: true });
+    } else {
+      await execFileAsync("which", [command]);
+    }
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function listInstalledEditors(): Promise<InstalledEditor[]> {
+  const detected: InstalledEditor[] = [];
+  for (const candidate of EDITOR_CANDIDATES) {
+    let found = false;
+    for (const cmd of candidate.commands) {
+      if (await commandExists(cmd)) {
+        found = true;
+        break;
+      }
+    }
+    if (found) detected.push({ id: candidate.id, label: candidate.label });
+  }
+  return detected;
+}
+
+async function resolveEditorCommand(editorId: InstalledEditor["id"]): Promise<string | null> {
+  const candidate = EDITOR_CANDIDATES.find((c) => c.id === editorId);
+  if (!candidate) return null;
+  for (const cmd of candidate.commands) {
+    if (await commandExists(cmd)) return cmd;
+  }
+  return null;
+}
+
+async function launchProjectInEditor(projectPath: string, editorId: InstalledEditor["id"]): Promise<{ success: boolean; message?: string }> {
+  if (!projectPath || !fs.existsSync(projectPath)) {
+    return { success: false, message: "Project path does not exist" };
+  }
+  const command = await resolveEditorCommand(editorId);
+  if (!command) {
+    return { success: false, message: `${editorId === "vscode" ? "VS Code" : "Cursor"} is not installed or not on PATH` };
+  }
+  try {
+    const child = spawn(command, [projectPath], {
+      detached: true,
+      stdio: "ignore",
+      shell: process.platform === "win32",
+      windowsHide: true,
+    });
+    child.unref();
+    return { success: true };
+  } catch (err) {
+    return { success: false, message: err instanceof Error ? err.message : String(err) };
+  }
+}
+
+const CODEX_HISTORY_SEED_MAX_CHARS = 28_000;
+
+function buildCodexHistorySeed(history: ThreadMessage[], latestUserContent: string): string | undefined {
+  if (!history.length) return undefined;
+  const chat = history.filter((m) => m.role === "user" || m.role === "assistant");
+  if (chat.length === 0) return undefined;
+
+  let prior = chat;
+  const last = chat[chat.length - 1];
+  if (last?.role === "user" && last.content.trim() === latestUserContent.trim()) {
+    prior = chat.slice(0, -1);
+  }
+  if (prior.length === 0) return undefined;
+
+  const parts: string[] = [];
+  let used = 0;
+  for (let i = prior.length - 1; i >= 0; i -= 1) {
+    const msg = prior[i];
+    const content = msg.content.trim();
+    if (!content) continue;
+    const block = `${msg.role === "user" ? "User" : "Assistant"}:\n${content}`;
+    const len = block.length + 2;
+    if (used + len > CODEX_HISTORY_SEED_MAX_CHARS) break;
+    parts.unshift(block);
+    used += len;
+  }
+  if (parts.length === 0) return undefined;
+
+  return `Previous conversation context from this thread (before switching to Codex):\n\n${parts.join("\n\n")}`;
+}
+
+function sanitizeToolArgsForUi(name: string, args?: Record<string, unknown>): Record<string, unknown> | undefined {
+  if (!args) return undefined;
+  const tool = coreToolName(name);
+  if (tool === "write_file") {
+    const pathVal = safePreviewString(readStringArg(args, ["path", "filePath", "file_path", "relative_path"]), 2_000);
+    const contentVal = safePreviewString(readStringArg(args, ["content", "text", "new_content", "fileContent"]));
+    if (!pathVal && !contentVal) return undefined;
+    return { path: pathVal, content: contentVal };
+  }
+  if (tool === "edit_file") {
+    const pathVal = safePreviewString(readStringArg(args, ["path", "filePath", "file_path", "relative_path"]), 2_000);
+    const oldStrVal = safePreviewString(readStringArg(args, ["old_string", "oldString", "oldText", "old_content"]));
+    const newStrVal = safePreviewString(readStringArg(args, ["new_string", "newString", "newText", "new_content", "replacement"]));
+    const patchVal = safePreviewString(readStringArg(args, ["patch", "diff", "changes", "unified_diff"]));
+    if (!pathVal && !oldStrVal && !newStrVal && !patchVal) return undefined;
+    return { path: pathVal, old_string: oldStrVal, new_string: newStrVal, patch: patchVal };
+  }
+  if (tool === "apply_patch") {
+    const patchVal = safePreviewString(readStringArg(args, ["patch", "diff", "changes", "content"]));
+    if (!patchVal) return undefined;
+    return { patch: patchVal };
+  }
+  return undefined;
 }
 
 function createWindow() {
@@ -254,6 +466,8 @@ function createThreadRunUiBridge(threadId: string): ThreadRunUiBridge {
     onChunk: (chunk) => emit("agent:chunk", { threadId, chunk }),
     onToolStart: (name, detail, args) => {
       const meta: Record<string, unknown> = { toolName: name, toolDetail: detail, pending: true };
+      const toolArgs = sanitizeToolArgsForUi(name, args);
+      if (toolArgs) meta.toolArgs = toolArgs;
       if (name === "spawn_task" && args) {
         meta.isTask = true;
         meta.taskType = String(args.type || "general");
@@ -288,6 +502,7 @@ interface UnifiedProviderRunInput {
   projectId: string;
   projectRoot: string;
   content: string;
+  history: ThreadMessage[];
   images?: z.infer<typeof sendMessageInputSchema>["images"];
   permissionMode: "full" | "approve";
   abortSignal: AbortSignal;
@@ -319,13 +534,16 @@ async function runUnifiedProviderTurn(input: UnifiedProviderRunInput): Promise<U
   if (activeProvider.id === "codex") {
     const credential = await getProviderCredential("codex");
     if (!credential) throw new Error("codex is enabled but credential is not configured.");
+    const localCodexThreadId = store.getThread(input.threadId)?.codexThreadId;
+    const seedHistoryText = localCodexThreadId ? undefined : buildCodexHistorySeed(input.history, input.content.trim());
 
     const codexResult = await runCodexAppServerTurn({
       provider: activeProvider,
       credential,
       projectRoot: input.projectRoot,
       localThreadId: input.threadId,
-      localCodexThreadId: store.getThread(input.threadId)?.codexThreadId,
+      localCodexThreadId,
+      seedHistoryText,
       content: input.content.trim(),
       images: input.images,
       permissionMode: input.permissionMode,
@@ -350,7 +568,7 @@ async function runUnifiedProviderTurn(input: UnifiedProviderRunInput): Promise<U
 
   const result = await runAgent({
     providers,
-    history: store.getMessages(input.threadId),
+    history: input.history,
     projectRoot: input.projectRoot,
     settings: store.getSettings(),
     abortSignal: input.abortSignal,
@@ -404,6 +622,7 @@ async function sendMessageInternal(parsed: z.infer<typeof sendMessageInputSchema
         projectId: project.id,
         projectRoot: project.folderPath,
         content: parsed.content,
+        history: threadMsgs,
         images: parsed.images,
         permissionMode: parsed.permissionMode === "approve" ? "approve" : "full",
         abortSignal: controller.signal,
@@ -471,12 +690,62 @@ function registerIpc() {
     return store.createProject(parsed);
   });
 
+  ipcMain.handle("project:delete", (_event, projectId: unknown) => {
+    const id = String(projectId || "");
+    if (!id) throw new Error("Project ID is required");
+    const threads = store.getState().threads.filter((thread) => thread.projectId === id);
+    for (const thread of threads) {
+      const controller = runControllers.get(thread.id);
+      if (controller) {
+        controller.abort();
+        runControllers.delete(thread.id);
+      }
+    }
+    store.deleteProject(id);
+    return toRendererState(store.getState());
+  });
+
+  ipcMain.handle("project:open-in-explorer", async (_event, projectPath: unknown) => {
+    const dir = String(projectPath || "");
+    if (!dir || !fs.existsSync(dir)) {
+      return { success: false, message: "Project path does not exist" };
+    }
+    const openErr = await shell.openPath(dir);
+    if (openErr) {
+      return { success: false, message: openErr };
+    }
+    return { success: true };
+  });
+
+  ipcMain.handle("editor:list", async () => {
+    return listInstalledEditors();
+  });
+
+  ipcMain.handle("project:open-in-editor", async (_event, projectPath: unknown, editorId: unknown) => {
+    const dir = String(projectPath || "");
+    const id = String(editorId || "") as InstalledEditor["id"];
+    if (id !== "vscode" && id !== "cursor") {
+      return { success: false, message: "Unsupported editor" };
+    }
+    return launchProjectInEditor(dir, id);
+  });
+
   ipcMain.handle("thread:create", (_event, payload: unknown) => {
     const parsed = newThreadInputSchema.parse(payload);
     if (!store.getState().projects.some((project) => project.id === parsed.projectId)) {
       throw new Error("Project not found");
     }
     return store.createThread(parsed);
+  });
+
+  ipcMain.handle("thread:update", (_event, payload: unknown) => {
+    const parsed = threadUpdateInputSchema.parse(payload);
+    const updated = store.updateThread(parsed.threadId, {
+      title: parsed.title,
+      codexThreadId: parsed.codexThreadId,
+      lastModel: parsed.lastModel,
+    });
+    return updated ?? null;
   });
 
   ipcMain.handle("thread:delete", (_event, threadId: unknown) => {
@@ -658,31 +927,49 @@ function registerIpc() {
       // Get status to know which files changed
       const { stdout: statusOut } = await execFileAsync("git", ["status", "--porcelain"], { cwd: dir });
       const statusLines = statusOut.split("\n").filter((l) => l.trim());
-      const entries: Array<{ file: string; status: string; diff: string }> = [];
+      const entries: Array<{
+        file: string;
+        status: "modified" | "added" | "deleted" | "renamed" | "untracked";
+        diff: string;
+        beforeContent?: string;
+        afterContent?: string;
+      }> = [];
+      const seenFiles = new Set<string>();
 
-      for (const line of statusLines) {
-        const indexStatus = line[0];
-        const workStatus = line[1];
-        const fileName = line.slice(3).trim();
-        let status = "modified";
-        if (indexStatus === "?" || workStatus === "?") status = "untracked";
-        else if (indexStatus === "A" || workStatus === "A") status = "added";
-        else if (indexStatus === "D" || workStatus === "D") status = "deleted";
-        else if (indexStatus === "R") status = "renamed";
+      const addEntryForPath = async (
+        rawFileName: string,
+        status: "modified" | "added" | "deleted" | "renamed" | "untracked"
+      ) => {
+        const fileName = normalizeGitPath(rawFileName);
+        if (!fileName || seenFiles.has(fileName)) return;
+        seenFiles.add(fileName);
 
+        const renameParts = status === "renamed" ? fileName.split(" -> ") : [];
+        const oldPath = renameParts.length === 2 ? renameParts[0].trim() : fileName;
+        const newPath = renameParts.length === 2 ? renameParts[1].trim() : fileName;
         let diff = "";
+        let beforeContent: string | undefined;
+        let afterContent: string | undefined;
+
+        const resolvedNewPath = resolveInsideProject(dir, newPath);
+
+        if (status === "modified") {
+          beforeContent = await readGitHeadFile(dir, oldPath);
+          if (resolvedNewPath) afterContent = readTextFileIfSmall(resolvedNewPath);
+        } else if (status === "renamed") {
+          beforeContent = await readGitHeadFile(dir, oldPath);
+          if (resolvedNewPath) afterContent = readTextFileIfSmall(resolvedNewPath);
+        } else if (status === "deleted") {
+          beforeContent = await readGitHeadFile(dir, oldPath);
+          afterContent = "";
+        } else if (status === "added" || status === "untracked") {
+          beforeContent = "";
+          if (resolvedNewPath) afterContent = readTextFileIfSmall(resolvedNewPath);
+        }
+
         try {
           if (status === "untracked") {
-            // Show file content for untracked files (limited)
-            const filePath = path.join(dir, fileName);
-            if (fs.existsSync(filePath)) {
-              const stat = fs.statSync(filePath);
-              if (stat.size < 50_000) {
-                diff = fs.readFileSync(filePath, "utf-8");
-              } else {
-                diff = `[File too large: ${Math.round(stat.size / 1024)}KB]`;
-              }
-            }
+            diff = afterContent ?? "";
           } else {
             const { stdout: diffOut } = await execFileAsync("git", ["diff", "--", fileName], { cwd: dir, maxBuffer: 1024 * 1024 });
             diff = diffOut;
@@ -694,8 +981,37 @@ function registerIpc() {
           }
         } catch { /* ignore diff errors */ }
 
-        entries.push({ file: fileName, status, diff });
+        entries.push({ file: fileName, status, diff, beforeContent, afterContent });
+      };
+
+      for (const line of statusLines) {
+        const indexStatus = line[0];
+        const workStatus = line[1];
+        const rawFileName = line.slice(3).trim();
+        let status: "modified" | "added" | "deleted" | "renamed" | "untracked" = "modified";
+        if (indexStatus === "?" || workStatus === "?") status = "untracked";
+        else if (indexStatus === "A" || workStatus === "A") status = "added";
+        else if (indexStatus === "D" || workStatus === "D") status = "deleted";
+        else if (indexStatus === "R") status = "renamed";
+
+        const normalizedPath = normalizeGitPath(rawFileName);
+        if (status === "untracked") {
+          const dirRel = normalizedPath.replace(/\/+$/, "");
+          const absDir = resolveInsideProject(dir, dirRel);
+          if (absDir && fs.existsSync(absDir) && fs.statSync(absDir).isDirectory()) {
+            const files = listFilesRecursively(absDir, 400);
+            for (const absFile of files) {
+              const relFile = normalizeGitPath(path.relative(dir, absFile));
+              if (!relFile || relFile.startsWith("..")) continue;
+              await addEntryForPath(relFile, "untracked");
+            }
+            continue;
+          }
+        }
+
+        await addEntryForPath(normalizedPath, status);
       }
+      entries.sort((a, b) => a.file.localeCompare(b.file));
       return entries;
     } catch {
       return [];
