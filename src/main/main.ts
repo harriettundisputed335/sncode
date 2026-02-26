@@ -15,6 +15,7 @@ import { discoverSkills, loadSkillContent, installSkill, deleteSkill } from "./s
 import { Store } from "./store";
 import { runCodexAppServerTurn } from "./codex-app-server";
 import { mcpManager } from "./mcp";
+import { registerCliCommand } from "./cli-installer";
 import {
   agentSettingsSchema,
   newProjectInputSchema,
@@ -1154,6 +1155,7 @@ app.whenReady().then(() => {
   store.load();
   registerIpc();
   createWindow();
+  registerCliCommand();
 });
 
 app.on("window-all-closed", () => {
