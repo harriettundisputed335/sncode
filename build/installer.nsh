@@ -1,6 +1,10 @@
 ; SnCode — Custom NSIS installer configuration
 ; Included by electron-builder via the "include" option in package.json
 
+!include "StrFunc.nsh"
+${StrStr}
+${StrRep}
+
 !macro customHeader
   ; ── Welcome page ──
   !ifndef MUI_WELCOMEPAGE_TITLE
@@ -33,7 +37,7 @@
   ReadRegStr $0 HKCU "Environment" "PATH"
 
   ; Only append if the install dir is not already present
-  ${StrContains} $1 "$INSTDIR" "$0"
+  ${StrStr} $1 "$0" "$INSTDIR"
   StrCmp $1 "" 0 path_already_set
     ; Append install dir to user PATH
     StrCmp $0 "" 0 has_existing_path
@@ -51,7 +55,7 @@
 ; ── Remove install directory from user PATH on uninstall ──
 !macro customUnInstall
   ReadRegStr $0 HKCU "Environment" "PATH"
-  ${StrContains} $1 "$INSTDIR" "$0"
+  ${StrStr} $1 "$0" "$INSTDIR"
   StrCmp $1 "" path_clean 0
     ; Simple removal: replace $INSTDIR; or ;$INSTDIR with empty string
     ${StrRep} $2 "$0" ";$INSTDIR" ""
