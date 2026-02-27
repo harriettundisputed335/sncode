@@ -14,13 +14,16 @@
 
 import sharp from "sharp";
 import pngToIco from "png-to-ico";
-import { writeFileSync, mkdirSync, unlinkSync } from "fs";
+import { readFileSync, writeFileSync, mkdirSync, unlinkSync } from "fs";
 import { join, dirname } from "path";
 import { fileURLToPath } from "url";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const buildDir = join(__dirname, "..", "build");
 mkdirSync(buildDir, { recursive: true });
+const packageJson = JSON.parse(readFileSync(join(__dirname, "..", "package.json"), "utf8"));
+const appVersion = packageJson.version ?? "0.0.0";
+const installerVersionLabel = `v${appVersion}`;
 
 /* ─────────────────────────── SVGs ─────────────────────────── */
 
@@ -129,7 +132,7 @@ const sidebarSvg = `
   <!-- Version, bottom center -->
   <text x="82" y="296" text-anchor="middle"
         font-family="Bahnschrift,'Segoe UI',sans-serif"
-        font-size="10" fill="#52525b">v0.2.0</text>
+        font-size="10" fill="#52525b">${installerVersionLabel}</text>
 </svg>`;
 
 // NSIS header: 150x57 — clean centered bar

@@ -71,6 +71,28 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      - name: Sync release version and regenerate installer assets
+        shell: pwsh
+        run: |
+          $tagVersion = "${{ github.ref }}"
+          $manualVersion = "${{ inputs.version }}"
+          $version =
+            if ($tagVersion -like "refs/tags/v*") {
+              $tagVersion.Substring(10)
+            } elseif (-not [string]::IsNullOrWhiteSpace($manualVersion)) {
+              $manualVersion
+            } else {
+              $current = Get-Content package.json -Raw | ConvertFrom-Json
+              $current.version
+            }
+
+          $version = $version.TrimStart("v")
+          $packageJson = Get-Content package.json -Raw | ConvertFrom-Json
+          $packageJson.version = $version
+          $packageJson | ConvertTo-Json -Depth 64 | Set-Content package.json -Encoding utf8
+          Write-Host "Using release version: $version"
+          npm run icons
+
       - name: Build
         run: npm run build
 
@@ -113,6 +135,28 @@ jobs:
 
       - name: Install dependencies
         run: npm ci
+
+      - name: Sync release version and regenerate installer assets
+        shell: pwsh
+        run: |
+          $tagVersion = "${{ github.ref }}"
+          $manualVersion = "${{ inputs.version }}"
+          $version =
+            if ($tagVersion -like "refs/tags/v*") {
+              $tagVersion.Substring(10)
+            } elseif (-not [string]::IsNullOrWhiteSpace($manualVersion)) {
+              $manualVersion
+            } else {
+              $current = Get-Content package.json -Raw | ConvertFrom-Json
+              $current.version
+            }
+
+          $version = $version.TrimStart("v")
+          $packageJson = Get-Content package.json -Raw | ConvertFrom-Json
+          $packageJson.version = $version
+          $packageJson | ConvertTo-Json -Depth 64 | Set-Content package.json -Encoding utf8
+          Write-Host "Using release version: $version"
+          npm run icons
 
       - name: Build
         run: npm run build
